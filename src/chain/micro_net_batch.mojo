@@ -141,6 +141,51 @@ struct BatchMicroNet(Copyable, Movable):
     def gate_size(self) -> Int:
         return self.hidden_dim * self.input_dim
 
+    def eval_mse(mut self, data: ChainData) raises -> Float32:
+        """Mean squared error on data (inference only, no gradients)."""
+        if data.n_samples == 0:
+            return 0.0
+
+        self.sync_ternary()
+        var loss: Float32 = 0.0
+        var inv_n = 1.0 / Float32(data.n_samples)
+
+        for sample in range(data.n_samples):
+            var pred = self._predict_at(data, sample)
+            var err = pred - data.y_at(sample)
+            loss += err * err * inv_n
+
+        return loss
+
+    def _predict_at(mut self, data: ChainData, sample: Int) -> Float32:
+        var x_base = data.x_offset(sample)
+
+        _ternary_matvec_rowmajor(
+            self.gate_ternary,
+            data.x_data,
+            x_base,
+            self.input_dim,
+            self.hidden_dim,
+            self._gate_buf,
+        )
+        _ternary_matvec_rowmajor(
+            self.up_ternary,
+            data.x_data,
+            x_base,
+            self.input_dim,
+            self.hidden_dim,
+            self._up_buf,
+        )
+
+        var y_tern: Float32 = 0.0
+        for j in range(self.hidden_dim):
+            var h = silu(self._gate_buf[j]) * self._up_buf[j]
+            var w = self.head_ternary[j]
+            if w != 0:
+                y_tern += Float32(w) * h
+
+        return self.alpha * y_tern
+
 
 def _ceildiv(n: Int, d: Int) -> Int:
     return (n + d - 1) // d

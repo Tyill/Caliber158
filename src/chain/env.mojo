@@ -26,6 +26,8 @@ struct TrainEnv(Copyable, Movable):
     var model_name: String
     var device: DeviceKind
     var train_backend: String
+    var holdout_fraction: Float32
+    var split_seed: UInt64
 
     @staticmethod
     def load() raises -> TrainEnv:
@@ -49,6 +51,8 @@ struct TrainEnv(Copyable, Movable):
             model_name=_env_string("CALIBER158_MODEL", "Qwen/Qwen2.5-0.5B"),
             device=resolve_device_from_env(),
             train_backend=train_backend_from_env(),
+            holdout_fraction=_env_float("CALIBER158_HOLDOUT_FRACTION", 0.1),
+            split_seed=UInt64(_env_int("CALIBER158_SEED", 42)),
         )
 
 

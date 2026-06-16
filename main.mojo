@@ -4,6 +4,7 @@ from std.sys import argv
 
 from src.chain import BatchMicroNet, TrainConfig, init_random_weights, train_chain
 from src.chain.buffer import ChainData
+from src.chain.holdout import no_holdout, split_holdout
 from src.chain.dataset import ChainDataset
 from src.chain.env import TrainEnv
 from src.chain.test_batch_grad import run_batch_grad_regression_test, run_gpu_backward_regression_test
@@ -56,7 +57,14 @@ def run_train(dataset_path: String, hidden_dim: Int, env: TrainEnv) raises -> No
     var model = BatchMicroNet(dataset.input_dim, hidden_dim)
     init_random_weights(model, env.init_scale)
 
-    train_chain(model, data, make_train_config(env, hidden_dim, env.epochs, env.batch_size))
+    var split = split_holdout(data, env.holdout_fraction, env.split_seed)
+
+    train_chain(
+        model,
+        split.train,
+        split.holdout,
+        make_train_config(env, hidden_dim, env.epochs, env.batch_size),
+    )
     print("done")
 
 
@@ -109,6 +117,7 @@ def main() raises:
         train_chain(
             model,
             data,
+            no_holdout(data),
             make_train_config(env, hidden_dim, env.smoke_epochs, env.smoke_batch_size),
         )
         return

@@ -1,6 +1,6 @@
 # Handoff для следующего чата
 
-Обновлено: 2026-06-16 (GPU v2 сделан)
+Обновлено: 2026-06-16 (holdout + Phase 1 quality runs)
 
 ## Идея проекта
 
@@ -58,6 +58,8 @@ Teacher: `TORCH=cuda|cpu`, `MODEL`, `SAMPLES`, `LAYER`, `NEURON`, …
 | `train.mojo` | `_train_epochs_cpu` / `_train_epochs_gpu` (`GpuTrainState` один раз на train) |
 | `adamw.mojo` | AdamW на host — **только CPU path** |
 | `device.mojo` | `DeviceKind`, `resolve_device_from_env()` |
+| `holdout.mojo` | train/holdout split (LCG shuffle, `CALIBER158_SEED`) |
+| `metrics.mojo` | `Var(Y)`, `relative_mse` |
 | `test_batch_grad.mojo` | CPU regression + `run_gpu_backward_regression_test()` |
 
 Удалено: `micro_net.mojo` (`accumulate_grad`, sample-by-sample).
@@ -81,6 +83,25 @@ quantize → forward (x_dev offset, alpha_dev) → backward → AdamW
 - **`make train-cuda`** на `L00_N0000.bin` (4096, RTX 3050 Ti): 10 epochs **~5 с** (было ~59 с в v1); MSE `44.6M → 9.9M` (≈ v1: `44.6M → 9.3M`)
 - Compile + run требуют видимый NVIDIA GPU (`sm_86` ок для 3050 Ti)
 
+### Holdout + тюнинг качества (2026-06-16)
+
+- **Holdout split** в train: `CALIBER158_HOLDOUT_FRACTION=0.1`, seed=`CALIBER158_SEED=42` → 3687 train / 409 holdout
+- Лог каждой эпохи: `train_mse`, `holdout_mse`, `rel_holdout = MSE/Var(Y)`
+- **Fix:** `download_shadow()` перед holdout eval на GPU path (иначе holdout_mse застывал)
+- `micro_net_batch.eval_mse()` — inference-only MSE на host
+- Прогоны и выводы: **`lerning_compare.md`**
+
+| Прогон | H | Epochs | Train MSE | Holdout MSE | rel_holdout | Время |
+|--------|---|--------|-----------|-------------|-------------|-------|
+| GPU v1 | 128 | 10 | 9.3×10⁶ | — | — | ~59 с |
+| Тюнинг | 256 | 50 | 0.0329 | — | ~0.99* | ~17 с |
+| Тюнинг | 512 | 100 | 0.0325 | — | ~0.98* | ~50 с |
+| **Holdout** | **512** | **30** | **0.0321** | **0.0384** | **1.04** | **~45 с** |
+
+\* train-only, до holdout
+
+**Вывод Phase 1:** train ≈ holdout ≈ `Var(Y)` → **underfit** (предсказание среднего), не overfit. Цель `rel < 0.001` — в ~1000× дальше. Следующий шаг — **архитектура v1**, не гиперпараметры.
+
 ### Уже прогнано пользователем
 
 - `data/chains/L00_N0000.bin` (14 MB) + `L00_N0000.json`, 4096 samples
@@ -96,42 +117,37 @@ quantize → forward (x_dev offset, alpha_dev) → backward → AdamW
 
 ## Текущая фаза
 
-**Phase 1**: одна цепочка `L00_N0000` — **дообучить до конца** и оценить качество.
+**Phase 1**: одна цепочка `L00_N0000` — качество **не достигнуто** (holdout проверен).
 
-Критерий успеха: holdout MSE < 1e-4 (или < 0.1% от `Var(Y_qwen)`).
+Критерий успеха: holdout MSE < 1e-4 (или `rel_holdout < 0.001`).
 
-GPU v2 закрыт по скорости; **следующий приоритет — качество**, не перенос на device.
+GPU v2 и holdout закрыты; **следующий приоритет — архитектура v1** (второй SwiGLU-блок + residual) или FP32 diagnostic run.
 
 ---
 
 ## Что делать дальше (приоритет)
 
-### 1. Качество Phase 1 — **следующий шаг**
+### 1. Архитектура v1 / диагностика — **следующий шаг**
 
-- **Holdout split** + relative MSE vs `Var(Y)`
-- Тюнинг: `HIDDEN_DIM` 256/512, больше `EPOCHS`, re-extract с `SAMPLES=100000`
-- **Checkpoint export** (см. ниже)
+- Holdout показал underfit (`rel_holdout ≈ 1.0` при H=512) — см. `lerning_compare.md`
+- v1: второй SwiGLU-блок + residual (`docs/architecture.md`)
+- Опц.: один прогон FP32 shadow без ternary — хватает ли ёмкости без квантизации
 
 ### 2. Checkpoint export (нет в коде)
 
 После успешного train — сохранять gate/up/head ternary, shadow (опц.), α, chain_id → `data/checkpoints/L00_N0000.bin` (формат не спроектирован). На GPU path: `GpuTrainState.download_shadow()` уже есть для чтения весов с device.
 
-### 3. Метрики качества
-
-- Relative MSE vs `Var(Y)`
-- `pred` vs teacher на holdout
-
-### 4. Phase 2 — batch extract layer 0
+### 3. Phase 2 — batch extract layer 0
 
 - `batch_extract.py`: 4864 цепочек → `L00_N####.bin`
 - Параллельный train worker pool
 - `data/chains/manifest.jsonl`
 
-### 5. Phase 3+
+### 4. Phase 3+
 
 - Сборка тернарного MLP слоя, 24 слоя FFN, attention — отдельно
 
-### 6. Документация
+### 5. Документация
 
 - **README** устарел: всё ещё `micro_net.mojo`, 3584/~530k chains, нет `DEVICE`/Makefile/GPU/`test-grad-gpu`
 - Обновить layout в README под `micro_net_batch`, `gpu/`, `Makefile`
@@ -183,7 +199,7 @@ make test-grad-gpu     # CPU vs GPU backward (нужен CUDA runtime)
 ## Известные ограничения / техдолг
 
 - README не синхронизирован с кодом (см. выше)
-- Нет holdout, нет checkpoint I/O, нет batch extract pipeline
+- Нет checkpoint I/O, нет batch extract pipeline
 - `mojo build` требует **видимый NVIDIA GPU** при compile (CI workaround — v2.1)
 - `make test` не включает `test-grad-gpu` (runtime GPU); build всё равно тянет GPU-модули
 - GPU grad regression: допуск **1e-4** (не 1e-5) из‑за float32 reorder в parallel matmul
@@ -207,7 +223,8 @@ make test-grad-gpu     # CPU vs GPU backward (нужен CUDA runtime)
 | MSE curve ≈ GPU v1 | ✅ 44.6M → 9.9M |
 | Нет per-batch upload весов/`X` | ✅ один upload at start |
 | Checkpoint export | ❌ |
-| Holdout | ❌ |
+| Holdout + relative MSE | ✅ `CALIBER158_HOLDOUT_FRACTION`, `lerning_compare.md` |
+| Phase 1 quality (`rel_holdout < 0.001`) | ❌ сейчас ~1.04 |
 | Teacher `make extract` без регрессии | ✅ (код не менялся) |
 
 ---
@@ -224,6 +241,7 @@ Caliber158/
 │   ├── buffer.mojo
 │   ├── micro_net_batch.mojo
 │   ├── train.mojo, adamw.mojo, dataset.mojo, env.mojo, device.mojo
+│   ├── holdout.mojo, metrics.mojo
 │   ├── ternary.mojo, grads.mojo, rng.mojo
 │   ├── test_batch_grad.mojo
 │   └── gpu/
@@ -237,6 +255,7 @@ Caliber158/
 ├── python/
 ├── scripts/
 ├── docs/
+├── lerning_compare.md  # сравнение прогонов train/holdout
 ├── data/chains/          # L00_N0000.bin + .json (generated)
 └── models/huggingface/
 ```
