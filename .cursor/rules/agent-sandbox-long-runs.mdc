@@ -1,0 +1,41 @@
+---
+description: Agent shell — no chained long train/benchmark batches in Cursor sandbox
+alwaysApply: true
+---
+
+# Agent Sandbox: Long Runs And Train Batches
+
+On Linux, Cursor agent commands run inside **`cursorsandbox`** with AppArmor profile `cursor_sandbox`. That profile **blocks SIGKILL from the user terminal** (`peer=unconfined`). If a long chained command is interrupted or the chat stops, child processes can **orphan under PID 1** and stay alive until Cursor restart or `aa-complain` on the profile.
+
+## Hard rule
+
+- **One experiment / one train run = one Shell tool invocation.** Do not chain multiple GPU/CPU train or benchmark runs with `&&`, `;`, or wrapper `run()` loops in a single agent command.
+- **No multi-run sweeps in sandbox** (e.g. `#T11 && #T12 && #T13 …`). Run sequentially across separate tool calls so each run can be stopped independently.
+- **Early-stop on bad metrics.** If holdout `rel` explodes (≫ 1) or loss diverges, do not continue the batch — log and stop.
+
+## Prefer for long work
+
+| Work | Agent | User terminal (outside sandbox) |
+|------|-------|----------------------------------|
+| Single smoke / parity / one train | OK | OK |
+| Multi-epoch train (`make train-torch`, `make train-cuda`) | One run only | Preferred for sweeps |
+| A/B sweep (many arch/LR/H combos) | **Avoid** — give commands | Preferred |
+
+When a sweep is needed, output **copy-paste commands** for the user terminal instead of running the whole matrix in one sandbox session.
+
+## Examples
+
+```bash
+# BAD — one agent call, orphans if interrupted
+run "#T11" ... && run "#T12" ... && run "#T13" ...
+
+# GOOD — one agent call per experiment
+CALIBER158_ARCH=v1 CALIBER158_EPOCHS=50 make train-torch
+
+# GOOD — user runs locally (document in lerning_compare.md after)
+# for h in 512 768; do ...; done
+```
+
+## If processes stick
+
+Orphan `cursorsandbox` PIDs cannot be killed with `kill -9` / `sudo kill -9` from a normal shell. **Restart Cursor**, or temporarily `sudo aa-complain /etc/apparmor.d/cursor-sandbox` before kill, then `aa-enforce`.
