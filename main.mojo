@@ -11,9 +11,11 @@ from src.chain.test_batch_grad import (
 from src.chain import BatchMicroNet, TrainConfig, init_random_weights, train_chain
 from src.chain.arch import arch_label
 from src.chain.buffer import ChainData
+from src.chain.grads import ModelGrads
 from src.chain.holdout import no_holdout, split_holdout
 from src.chain.dataset import ChainDataset
 from src.chain.env import TrainEnv
+from src.chain.rng import lcg_next, unit_float
 
 
 def print_info(env: TrainEnv) -> None:
@@ -78,6 +80,49 @@ def run_train(dataset_path: String, hidden_dim: Int, env: TrainEnv) raises -> No
     print("done")
 
 
+def run_parity_export(env: TrainEnv) raises -> None:
+    """JSON lines for Torch parity tests: holdout indices + one-batch CPU loss."""
+    var n = 4096
+    var fraction = Float32(0.1)
+    var seed = UInt64(42)
+
+    var indices = List[Int](capacity=n)
+    for i in range(n):
+        indices.append(i)
+    var rng = seed
+    for i in range(n - 1, 0, -1):
+        rng = lcg_next(rng)
+        var j = Int(unit_float(rng) * Float32(i + 1))
+        var tmp = indices[i]
+        indices[i] = indices[j]
+        indices[j] = tmp
+
+    var holdout_count = Int(Float32(n) * fraction)
+    if holdout_count < 1:
+        holdout_count = 1
+    if holdout_count >= n:
+        holdout_count = n - 1
+    var train_count = n - holdout_count
+
+    print('{"kind":"holdout","n":', n, ',"holdout_count":', holdout_count, ',"train_count":', train_count, ',"holdout_indices":[', sep="")
+    for i in range(holdout_count):
+        if i > 0:
+            print(",", end="")
+        print(indices[i], end="")
+    print("]}")
+
+    var input_dim = 32
+    var hidden_dim = 8
+    var batch_size = 16
+    var dataset = ChainDataset.synthetic(batch_size, input_dim)
+    var data = ChainData.from_dataset(dataset)
+    var model = BatchMicroNet(input_dim, hidden_dim, use_ternary=True)
+    init_random_weights(model, env.init_scale)
+    var grads = ModelGrads.zeros_for_model(input_dim, hidden_dim, model.arch)
+    var loss = model.train_step_cpu(data, 0, batch_size, grads)
+    print('{"kind":"batch_loss","input_dim":', input_dim, ',"hidden_dim":', hidden_dim, ',"batch_size":', batch_size, ',"loss":', loss, '}', sep="")
+
+
 def main() raises:
     var env = TrainEnv.load()
     var args = argv()
@@ -138,6 +183,10 @@ def main() raises:
             no_holdout(data),
             make_train_config(env, hidden_dim, env.smoke_epochs, env.smoke_batch_size),
         )
+        return
+
+    if command == "parity-export":
+        run_parity_export(env)
         return
 
     print("unknown command:", command)

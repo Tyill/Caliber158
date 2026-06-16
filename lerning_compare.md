@@ -248,6 +248,9 @@
 | **FP32 v0 + holdout** | **512** | **30** | **0.0327** | **0.0372** | **1.004** | **~36 с** |
 | **v1 ternary + holdout** | **512** | **30** | **0.0321** | **0.0382** | **1.03** | **~63 с** |
 | **FP32 v1 + holdout** | **512** | **30** | **0.0327** | **0.0372** | **1.004** | **~56 с** |
+| **Torch #T1 v0** | **512** | **30** | **0.0321** | **0.0383** | **1.033** | **~7 с** |
+| **Torch #T2 v1** | **512** | **30** | **0.0321** | **0.0383** | **1.033** | **~7 с** |
+| **Torch #T3 FP32 v1** | **512** | **30** | **0.0328** | **0.0373** | **1.004** | **~6 с** |
 
 \* train MSE / Var(Y), holdout не измерялся
 
@@ -282,4 +285,73 @@ CALIBER158_ARCH=v1 CALIBER158_QUANTIZE=0 make train-fp32-v1-cuda
 CALIBER158_ARCH=v1 CALIBER158_HIDDEN_DIM=512 CALIBER158_LR=0.003 \
   CALIBER158_WEIGHT_DECAY=0.001 CALIBER158_EPOCHS=30 make train-cuda
 make test-grad-v1 test-grad-gpu-v1
+```
+
+---
+
+## Torch student prototype (#T1–#T3)
+
+**Backend:** PyTorch (`make train-torch`), parity gate: `make test-torch-parity`  
+**Датасет / split:** тот же `L00_N0000.bin`, holdout @ `SEED=42` (3687 / 409)  
+**Паритет:** holdout indices + 1-batch loss vs Mojo CPU (`tests/test_holdout_golden.py`, `tests/test_forward_loss_mojo.py`)
+
+### #T1 — v0 ternary + holdout ✅
+
+| Параметр | Значение |
+|----------|----------|
+| `CALIBER158_ARCH` | v0 |
+| `HIDDEN_DIM` | 512 |
+| `EPOCHS` | 30 |
+| `LR` / `WEIGHT_DECAY` | 0.003 / 0.001 |
+| Params | 918 017 |
+| Device | CUDA (Torch) |
+
+| Epoch 29 | train_mse | holdout_mse | rel_holdout |
+|----------|-----------|-------------|-------------|
+| | 0.0321 | 0.0383 | **1.033** |
+
+| | |
+|--|--|
+| Wall time | ~7 с |
+| vs Mojo #5 holdout | **≈ то же** (rel 1.04 vs 1.033) |
+
+### #T2 — v1 ternary + holdout ✅
+
+| Параметр | Значение |
+|----------|----------|
+| `CALIBER158_ARCH` | v1 |
+| Params | 1 442 305 |
+
+| Epoch 29 | train_mse | holdout_mse | rel_holdout |
+|----------|-----------|-------------|-------------|
+| | 0.0321 | 0.0383 | **1.033** |
+
+| | |
+|--|--|
+| Wall time | ~7 с |
+| vs Mojo #6 | **≈ то же** (rel 1.03) |
+
+### #T3 — FP32 v1 diagnostic + holdout ✅
+
+| Параметр | Значение |
+|----------|----------|
+| `CALIBER158_ARCH` | v1 |
+| `CALIBER158_QUANTIZE` | 0 |
+
+| Epoch 29 | train_mse | holdout_mse | rel_holdout |
+|----------|-----------|-------------|-------------|
+| | 0.0328 | 0.0373 | **1.004** |
+
+| | |
+|--|--|
+| Wall time | ~6 с |
+| vs Mojo #6b | **≈ то же** (rel 1.004) |
+
+**Вывод:** Torch-prototype воспроизводит Mojo holdout/split и финальные `rel` на том же плато underfit. Быстрый A/B arch в Torch (~7 с vs ~45–63 с Mojo GPU) без изменения `make test`.
+
+```bash
+make test-torch-parity   # gate: holdout + 1-batch loss vs Mojo
+make train-torch         # env как train-cuda
+CALIBER158_ARCH=v1 CALIBER158_HIDDEN_DIM=512 CALIBER158_EPOCHS=30 \
+  CALIBER158_LR=0.003 CALIBER158_WEIGHT_DECAY=0.001 make train-torch
 ```

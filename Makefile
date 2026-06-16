@@ -7,7 +7,8 @@ PIXI := pixi run
 MOJO := $(PIXI) mojo
 
 .PHONY: help install setup setup-python build check test test-grad test-grad-v1 test-grad-gpu test-grad-gpu-v1 smoke smoke-cpu smoke-cuda \
-	info extract train train-cpu train-cuda train-fp32-cuda train-fp32-v1-cuda clean
+	info extract train train-cpu train-cuda train-fp32-cuda train-fp32-v1-cuda \
+	train-torch smoke-torch test-torch-parity clean
 
 help: ## Show targets
 	@printf "Caliber158 — common targets (run from repo root):\n\n"
@@ -78,6 +79,15 @@ train-fp32-cuda: build ## FP32 v0 diagnostic (QUANTIZE=0, holdout from .env)
 
 train-fp32-v1-cuda: build ## FP32 v1 diagnostic (ARCH=v1, QUANTIZE=0)
 	CALIBER158_DEVICE=cuda CALIBER158_ARCH=v1 CALIBER158_QUANTIZE=0 $(PIXI) train
+
+train-torch: ## Torch student train on CALIBER158_DATASET (not in make test)
+	$(PIXI) train-torch
+
+smoke-torch: ## Torch student smoke on synthetic LCG data (not in make test)
+	$(PIXI) smoke-torch
+
+test-torch-parity: build ## Holdout golden + 1-batch loss vs Mojo CPU (gate for Torch prototype)
+	$(PIXI) test-torch-parity
 
 clean: ## Remove local build artifacts
 	rm -rf main.o main __pycache__ python/__pycache__ .mojo-cache
