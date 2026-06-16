@@ -3,9 +3,11 @@
 from std.sys import argv
 
 from src.chain import BatchMicroNet, TrainConfig, init_random_weights, train_chain
+from src.chain.arch import ArchKind
 from src.chain.buffer import ChainData
 from src.chain.dataset import ChainDataset
 from src.chain.env import TrainEnv
+from src.chain.holdout import no_holdout, split_holdout
 from src.chain.test_batch_grad import run_batch_grad_regression_test, run_gpu_backward_regression_test
 
 
@@ -14,6 +16,7 @@ def print_info(env: TrainEnv) -> None:
     print("  model     :", env.model_name)
     print("  hidden    :", env.hidden_size, "(teacher input dim)")
     print("  hidden_dim:", env.hidden_dim, "(student width, CALIBER158_HIDDEN_DIM)")
+    print("  arch      :", env.arch.label(), "(CALIBER158_ARCH)")
     print("  dataset   :", env.dataset_path)
     print("  device    :", env.device.label())
     print("  backend   :", env.train_backend)
@@ -27,6 +30,7 @@ def print_info(env: TrainEnv) -> None:
 
 def make_train_config(env: TrainEnv, hidden_dim: Int, epochs: Int, batch_size: Int) -> TrainConfig:
     return TrainConfig(
+        arch=env.arch.copy(),
         hidden_dim=hidden_dim,
         epochs=epochs,
         batch_size=batch_size,
@@ -53,10 +57,11 @@ def run_train(dataset_path: String, hidden_dim: Int, env: TrainEnv) raises -> No
             env.hidden_size,
         )
 
-    var model = BatchMicroNet(dataset.input_dim, hidden_dim)
-    init_random_weights(model, env.init_scale)
+    var split = split_holdout(data, env.holdout_fraction, env.seed)
+    var model = BatchMicroNet(dataset.input_dim, hidden_dim, env.arch.copy(), block2_residual_scale=env.block2_residual_scale)
+    init_random_weights(model, env.init_scale, env.init_scale_block2)
 
-    train_chain(model, data, make_train_config(env, hidden_dim, env.epochs, env.batch_size))
+    train_chain(model, split.train, split.holdout, make_train_config(env, hidden_dim, env.epochs, env.batch_size))
     print("done")
 
 
@@ -104,11 +109,12 @@ def main() raises:
             hidden_dim = Int(args[2])
         var dataset = ChainDataset.synthetic(env.smoke_samples, env.hidden_size)
         var data = ChainData.from_dataset(dataset)
-        var model = BatchMicroNet(env.hidden_size, hidden_dim)
-        init_random_weights(model, env.init_scale)
+        var model = BatchMicroNet(env.hidden_size, hidden_dim, env.arch.copy(), block2_residual_scale=env.block2_residual_scale)
+        init_random_weights(model, env.init_scale, env.init_scale_block2)
         train_chain(
             model,
             data,
+            no_holdout(data),
             make_train_config(env, hidden_dim, env.smoke_epochs, env.smoke_batch_size),
         )
         return

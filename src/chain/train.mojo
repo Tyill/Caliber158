@@ -1,17 +1,21 @@
 """Training loop: batched MSE + STE backward + AdamW."""
 
 from .adamw import AdamWConfig, AdamWState
+from .arch import ArchKind
 from .buffer import ChainData
 from .device import DeviceKind, cuda_available
 from .grads import ModelGrads
 from .gpu.batch_step import train_step_gpu
 from .gpu.buffer_pool import GpuTrainState
+from .holdout import HoldoutSplit
+from .metrics import relative_mse
 from .micro_net_batch import BatchMicroNet
 from .rng import lcg_next, unit_float
 
 
 @fieldwise_init
 struct TrainConfig(Copyable, Movable):
+    var arch: ArchKind
     var hidden_dim: Int
     var epochs: Int
     var batch_size: Int
@@ -33,61 +37,97 @@ struct TrainConfig(Copyable, Movable):
         )
 
 
+def _log_epoch_metrics(
+    epoch: Int,
+    train_mse: Float32,
+    holdout: HoldoutSplit,
+    mut model: BatchMicroNet,
+) raises -> None:
+    if holdout.holdout.n_samples == 0:
+        print("epoch ", epoch, " train_mse=", train_mse)
+        return
+
+    var holdout_mse = model.eval_mse(holdout.holdout)
+    var rel = relative_mse(holdout_mse, holdout.var_y_holdout)
+    print(
+        "epoch ",
+        epoch,
+        " train_mse=",
+        train_mse,
+        " holdout_mse=",
+        holdout_mse,
+        " rel_holdout=",
+        rel,
+    )
+
+
 def _train_epochs_cpu(
     mut model: BatchMicroNet,
     mut optimizer: AdamWState,
     mut grads: ModelGrads,
-    data: ChainData,
+    train_data: ChainData,
+    holdout: HoldoutSplit,
     config: TrainConfig,
 ) raises -> None:
     for epoch in range(config.epochs):
         var total_loss: Float32 = 0.0
         var batches = 0
         var i = 0
-        while i < data.n_samples:
-            var loss = model.train_step_cpu(data, i, config.batch_size, grads)
+        while i < train_data.n_samples:
+            var loss = model.train_step_cpu(train_data, i, config.batch_size, grads)
             optimizer.apply(model, grads, config.adamw_config())
             total_loss += loss
             batches += 1
             i += config.batch_size
         if epoch % config.log_every == 0 or epoch == config.epochs - 1:
             var avg = total_loss / Float32(batches)
-            print("epoch ", epoch, " mse=", avg)
+            _log_epoch_metrics(epoch, avg, holdout, model)
 
 
 def _train_epochs_gpu(
     mut model: BatchMicroNet,
-    data: ChainData,
+    train_data: ChainData,
+    holdout: HoldoutSplit,
     config: TrainConfig,
 ) raises -> None:
-    var state = GpuTrainState(data, model, config.batch_size)
+    var state = GpuTrainState(train_data, model, config.batch_size)
     var adamw_cfg = config.adamw_config()
 
     for epoch in range(config.epochs):
         var total_loss: Float32 = 0.0
         var batches = 0
         var i = 0
-        while i < data.n_samples:
+        while i < train_data.n_samples:
             var loss = train_step_gpu(state, i, config.batch_size, adamw_cfg)
             total_loss += loss
             batches += 1
             i += config.batch_size
         if epoch % config.log_every == 0 or epoch == config.epochs - 1:
             var avg = total_loss / Float32(batches)
-            print("epoch ", epoch, " mse=", avg)
+            if holdout.holdout.n_samples > 0:
+                state.download_shadow(model)
+            _log_epoch_metrics(epoch, avg, holdout, model)
+
+    if holdout.holdout.n_samples > 0:
+        state.download_shadow(model)
 
 
 def train_chain(
     mut model: BatchMicroNet,
-    data: ChainData,
+    train_data: ChainData,
+    holdout: HoldoutSplit,
     config: TrainConfig,
 ) raises -> None:
     """Epoch loop with STE + AdamW."""
     var use_gpu = config.device.is_cuda() and cuda_available()
 
     print(
-        "training chain: samples=",
-        data.n_samples,
+        "training chain: train_samples=",
+        train_data.n_samples,
+        " holdout_samples=",
+        holdout.holdout.n_samples,
+        " arch=",
+        config.arch.label(),
         " hidden=",
         config.hidden_dim,
         " params=",
@@ -99,26 +139,57 @@ def train_chain(
         " backend=mojo",
     )
 
+    if holdout.holdout.n_samples > 0:
+        print(
+            "holdout metrics: var_y_train=",
+            holdout.var_y_train,
+            " var_y_holdout=",
+            holdout.var_y_holdout,
+        )
+
     if use_gpu:
-        _train_epochs_gpu(model, data, config)
+        _train_epochs_gpu(model, train_data, holdout, config)
     else:
         var optimizer = AdamWState.from_model(model)
         var grads = ModelGrads.zeros(
             len(model.gate_shadow),
             len(model.up_shadow),
             len(model.head_shadow),
+            len(model.gate2_shadow),
+            len(model.up2_shadow),
         )
-        _train_epochs_cpu(model, optimizer, grads, data, config)
+        _train_epochs_cpu(model, optimizer, grads, train_data, holdout, config)
+
+    if holdout.holdout.n_samples > 0:
+        var final_mse = model.eval_mse(holdout.holdout)
+        var rel = relative_mse(final_mse, holdout.var_y_holdout)
+        print(
+            "final holdout_mse=",
+            final_mse,
+            " rel_holdout=",
+            rel,
+            " (phase1 rel target 0.001)",
+        )
 
 
-def init_random_weights(mut model: BatchMicroNet, scale: Float32 = 0.1) -> None:
+def init_random_weights(
+    mut model: BatchMicroNet,
+    block1_scale: Float32,
+    block2_scale: Float32,
+) -> None:
     """Small random init for shadow weights (LCG, no external RNG)."""
     var seed: UInt64 = 0xC158_C158
     for i in range(len(model.gate_shadow)):
         seed = lcg_next(seed)
-        model.gate_shadow[i] = (unit_float(seed) * 2.0 - 1.0) * scale
+        model.gate_shadow[i] = (unit_float(seed) * 2.0 - 1.0) * block1_scale
         seed = lcg_next(seed)
-        model.up_shadow[i] = (unit_float(seed) * 2.0 - 1.0) * scale
+        model.up_shadow[i] = (unit_float(seed) * 2.0 - 1.0) * block1_scale
     for i in range(len(model.head_shadow)):
         seed = lcg_next(seed)
-        model.head_shadow[i] = (unit_float(seed) * 2.0 - 1.0) * scale
+        model.head_shadow[i] = (unit_float(seed) * 2.0 - 1.0) * block1_scale
+    if model.arch.is_v1():
+        for i in range(len(model.gate2_shadow)):
+            seed = lcg_next(seed)
+            model.gate2_shadow[i] = (unit_float(seed) * 2.0 - 1.0) * block2_scale
+            seed = lcg_next(seed)
+            model.up2_shadow[i] = (unit_float(seed) * 2.0 - 1.0) * block2_scale

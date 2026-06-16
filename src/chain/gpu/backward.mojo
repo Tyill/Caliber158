@@ -252,3 +252,323 @@ def enqueue_backward(
         grid_dim=blocks_hd,
         block_dim=256,
     )
+
+
+def dlh_from_head_kernel(
+    err: UnsafePointer[Float32, MutAnyOrigin],
+    alpha: UnsafePointer[Float32, MutAnyOrigin],
+    head_tern: UnsafePointer[Int8, MutAnyOrigin],
+    dlh: UnsafePointer[Float32, MutAnyOrigin],
+    batch_size: Int,
+    hidden_dim: Int,
+    inv_batch: Float32,
+):
+    """dlh[b,j] = dL_dy_tern * head_tern[j]."""
+    var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+    var total = batch_size * hidden_dim
+    if idx >= total:
+        return
+    var b = idx // hidden_dim
+    var j = idx % hidden_dim
+    var dL_dy_tern = 2.0 * err[b] * inv_batch * alpha[0]
+    dlh[idx] = dL_dy_tern * Float32(head_tern[j])
+
+
+def backward_gate_up_partial_dlh_kernel(
+    dlh: UnsafePointer[Float32, MutAnyOrigin],
+    x: UnsafePointer[Float32, MutAnyOrigin],
+    hidden: UnsafePointer[Float32, MutAnyOrigin],
+    gate_act: UnsafePointer[Float32, MutAnyOrigin],
+    up_act: UnsafePointer[Float32, MutAnyOrigin],
+    gate_partial: UnsafePointer[Float32, MutAnyOrigin],
+    up_partial: UnsafePointer[Float32, MutAnyOrigin],
+    batch_size: Int,
+    hidden_dim: Int,
+    input_dim: Int,
+    residual_scale: Float32,
+):
+    """gate/up partial[b,j,i] from precomputed dL/dh and forward activations."""
+    var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+    var total = batch_size * hidden_dim * input_dim
+    if idx >= total:
+        return
+
+    var elems_per_batch = hidden_dim * input_dim
+    var b = idx // elems_per_batch
+    var rem = idx % elems_per_batch
+    var j = rem // input_dim
+    var i = rem % input_dim
+
+    var act_base = b * hidden_dim
+    var dL_dh = dlh[act_base + j] * residual_scale
+    var gate_j = gate_act[act_base + j]
+    var up_j = up_act[act_base + j]
+    var h_j = hidden[act_base + j]
+    var silu_gate = h_j / up_j if up_j != 0.0 else 0.0
+
+    var dL_dgate = dL_dh * up_j * _silu_derivative(gate_j)
+    var dL_dup = dL_dh * silu_gate
+
+    var x_base = b * input_dim
+    gate_partial[idx] = dL_dgate * x[x_base + i]
+    up_partial[idx] = dL_dup * x[x_base + i]
+
+
+def accum_dh1_from_block2_kernel(
+    dlh: UnsafePointer[Float32, MutAnyOrigin],
+    gate_act: UnsafePointer[Float32, MutAnyOrigin],
+    up_act: UnsafePointer[Float32, MutAnyOrigin],
+    hidden: UnsafePointer[Float32, MutAnyOrigin],
+    gate_tern: UnsafePointer[Int8, MutAnyOrigin],
+    up_tern: UnsafePointer[Int8, MutAnyOrigin],
+    dh1_extra: UnsafePointer[Float32, MutAnyOrigin],
+    batch_size: Int,
+    hidden_dim: Int,
+    residual_scale: Float32,
+):
+    """dh1_extra[b,i] = sum_j STE contrib from block2 gate2/up2."""
+    var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+    var total = batch_size * hidden_dim
+    if idx >= total:
+        return
+    var b = idx // hidden_dim
+    var i = idx % hidden_dim
+    var act_base = b * hidden_dim
+    var acc: Float64 = 0.0
+    for j in range(hidden_dim):
+        var dL_dh = dlh[act_base + j] * residual_scale
+        var gate_j = gate_act[act_base + j]
+        var up_j = up_act[act_base + j]
+        var h_j = hidden[act_base + j]
+        var silu_gate = h_j / up_j if up_j != 0.0 else 0.0
+        var dL_dgate = dL_dh * up_j * _silu_derivative(gate_j)
+        var dL_dup = dL_dh * silu_gate
+        var row = j * hidden_dim
+        acc += Float64(dL_dgate) * Float64(gate_tern[row + i])
+        acc += Float64(dL_dup) * Float64(up_tern[row + i])
+    dh1_extra[idx] = Float32(acc)
+
+
+def vector_add_kernel(
+    a: UnsafePointer[Float32, MutAnyOrigin],
+    b: UnsafePointer[Float32, MutAnyOrigin],
+    dst: UnsafePointer[Float32, MutAnyOrigin],
+    n: Int,
+):
+    """dst[i] = a[i] + b[i]."""
+    var i = Int(block_idx.x * block_dim.x + thread_idx.x)
+    if i >= n:
+        return
+    dst[i] = a[i] + b[i]
+
+
+def enqueue_backward_v1(
+    ctx: DeviceContext,
+    x_dev: DeviceBuffer[DType.float32],
+    x_batch_offset: Int,
+    y_dev: DeviceBuffer[DType.float32],
+    y_batch_offset: Int,
+    gate_act_dev: DeviceBuffer[DType.float32],
+    up_act_dev: DeviceBuffer[DType.float32],
+    h1_dev: DeviceBuffer[DType.float32],
+    gate2_act_dev: DeviceBuffer[DType.float32],
+    up2_act_dev: DeviceBuffer[DType.float32],
+    h2_dev: DeviceBuffer[DType.float32],
+    hidden_dev: DeviceBuffer[DType.float32],
+    pred_dev: DeviceBuffer[DType.float32],
+    head_tern_dev: DeviceBuffer[DType.int8],
+    gate2_tern_dev: DeviceBuffer[DType.int8],
+    up2_tern_dev: DeviceBuffer[DType.int8],
+    alpha_dev: DeviceBuffer[DType.float32],
+    mut err_dev: DeviceBuffer[DType.float32],
+    mut loss_partial_dev: DeviceBuffer[DType.float32],
+    mut grad_alpha_partial_dev: DeviceBuffer[DType.float32],
+    mut grad_head_partial_dev: DeviceBuffer[DType.float32],
+    mut grad_gate_partial_dev: DeviceBuffer[DType.float32],
+    mut grad_up_partial_dev: DeviceBuffer[DType.float32],
+    mut grad_gate2_partial_dev: DeviceBuffer[DType.float32],
+    mut grad_up2_partial_dev: DeviceBuffer[DType.float32],
+    mut grad_gate_dev: DeviceBuffer[DType.float32],
+    mut grad_up_dev: DeviceBuffer[DType.float32],
+    mut grad_gate2_dev: DeviceBuffer[DType.float32],
+    mut grad_up2_dev: DeviceBuffer[DType.float32],
+    mut grad_head_dev: DeviceBuffer[DType.float32],
+    mut grad_alpha_dev: DeviceBuffer[DType.float32],
+    mut dlh_dev: DeviceBuffer[DType.float32],
+    mut dh1_extra_dev: DeviceBuffer[DType.float32],
+    mut dlh1_total_dev: DeviceBuffer[DType.float32],
+    mut loss_scalar_dev: DeviceBuffer[DType.float32],
+    batch_size: Int,
+    hidden_dim: Int,
+    input_dim: Int,
+    block2_residual_scale: Float32,
+) raises -> None:
+    """v1 backward: two SwiGLU blocks + residual hidden, partials + batch reduce."""
+    var inv_batch = 1.0 / Float32(batch_size)
+    var bh = batch_size * hidden_dim
+    var bhd = batch_size * hidden_dim * input_dim
+    var bhhd = batch_size * hidden_dim * hidden_dim
+    var blocks_b = _ceildiv(batch_size, 256)
+    var blocks_bh = _ceildiv(bh, 256)
+    var blocks_bhd = _ceildiv(bhd, 256)
+    var blocks_bhhd = _ceildiv(bhhd, 256)
+    var blocks_hd = _ceildiv(hidden_dim * input_dim, 256)
+    var blocks_hhd = _ceildiv(hidden_dim * hidden_dim, 256)
+    var blocks_h = _ceildiv(hidden_dim, 256)
+
+    var x_ptr = f32_ptr_offset(x_dev.unsafe_ptr(), x_batch_offset)
+    var y_ptr = f32_ptr_offset(y_dev.unsafe_ptr(), y_batch_offset)
+
+    ctx.enqueue_function[mse_err_kernel, mse_err_kernel](
+        pred_dev.unsafe_ptr(),
+        y_ptr,
+        err_dev.unsafe_ptr(),
+        loss_partial_dev.unsafe_ptr(),
+        batch_size,
+        inv_batch,
+        grid_dim=blocks_b,
+        block_dim=256,
+    )
+    ctx.enqueue_function[backward_alpha_partial_kernel, backward_alpha_partial_kernel](
+        pred_dev.unsafe_ptr(),
+        err_dev.unsafe_ptr(),
+        alpha_dev.unsafe_ptr(),
+        grad_alpha_partial_dev.unsafe_ptr(),
+        batch_size,
+        inv_batch,
+        grid_dim=blocks_b,
+        block_dim=256,
+    )
+    ctx.enqueue_function[backward_head_partial_kernel, backward_head_partial_kernel](
+        err_dev.unsafe_ptr(),
+        hidden_dev.unsafe_ptr(),
+        alpha_dev.unsafe_ptr(),
+        grad_head_partial_dev.unsafe_ptr(),
+        batch_size,
+        hidden_dim,
+        inv_batch,
+        grid_dim=blocks_bh,
+        block_dim=256,
+    )
+    ctx.enqueue_function[dlh_from_head_kernel, dlh_from_head_kernel](
+        err_dev.unsafe_ptr(),
+        alpha_dev.unsafe_ptr(),
+        head_tern_dev.unsafe_ptr(),
+        dlh_dev.unsafe_ptr(),
+        batch_size,
+        hidden_dim,
+        inv_batch,
+        grid_dim=blocks_bh,
+        block_dim=256,
+    )
+    ctx.enqueue_function[backward_gate_up_partial_dlh_kernel, backward_gate_up_partial_dlh_kernel](
+        dlh_dev.unsafe_ptr(),
+        h1_dev.unsafe_ptr(),
+        h2_dev.unsafe_ptr(),
+        gate2_act_dev.unsafe_ptr(),
+        up2_act_dev.unsafe_ptr(),
+        grad_gate2_partial_dev.unsafe_ptr(),
+        grad_up2_partial_dev.unsafe_ptr(),
+        batch_size,
+        hidden_dim,
+        hidden_dim,
+        block2_residual_scale,
+        grid_dim=blocks_bhhd,
+        block_dim=256,
+    )
+    ctx.enqueue_function[accum_dh1_from_block2_kernel, accum_dh1_from_block2_kernel](
+        dlh_dev.unsafe_ptr(),
+        gate2_act_dev.unsafe_ptr(),
+        up2_act_dev.unsafe_ptr(),
+        h2_dev.unsafe_ptr(),
+        gate2_tern_dev.unsafe_ptr(),
+        up2_tern_dev.unsafe_ptr(),
+        dh1_extra_dev.unsafe_ptr(),
+        batch_size,
+        hidden_dim,
+        block2_residual_scale,
+        grid_dim=blocks_bh,
+        block_dim=256,
+    )
+    ctx.enqueue_function[vector_add_kernel, vector_add_kernel](
+        dlh_dev.unsafe_ptr(),
+        dh1_extra_dev.unsafe_ptr(),
+        dlh1_total_dev.unsafe_ptr(),
+        bh,
+        grid_dim=blocks_bh,
+        block_dim=256,
+    )
+    ctx.enqueue_function[backward_gate_up_partial_dlh_kernel, backward_gate_up_partial_dlh_kernel](
+        dlh1_total_dev.unsafe_ptr(),
+        x_ptr,
+        h1_dev.unsafe_ptr(),
+        gate_act_dev.unsafe_ptr(),
+        up_act_dev.unsafe_ptr(),
+        grad_gate_partial_dev.unsafe_ptr(),
+        grad_up_partial_dev.unsafe_ptr(),
+        batch_size,
+        hidden_dim,
+        input_dim,
+        Float32(1.0),
+        grid_dim=blocks_bhd,
+        block_dim=256,
+    )
+
+    ctx.enqueue_function[reduce_sum_f32_kernel, reduce_sum_f32_kernel](
+        loss_partial_dev.unsafe_ptr(),
+        loss_scalar_dev.unsafe_ptr(),
+        batch_size,
+        grid_dim=1,
+        block_dim=1,
+    )
+    ctx.enqueue_function[reduce_sum_f32_kernel, reduce_sum_f32_kernel](
+        grad_alpha_partial_dev.unsafe_ptr(),
+        grad_alpha_dev.unsafe_ptr(),
+        batch_size,
+        grid_dim=1,
+        block_dim=1,
+    )
+    ctx.enqueue_function[reduce_batch_dim_head_kernel, reduce_batch_dim_head_kernel](
+        grad_head_partial_dev.unsafe_ptr(),
+        grad_head_dev.unsafe_ptr(),
+        batch_size,
+        hidden_dim,
+        grid_dim=blocks_h,
+        block_dim=256,
+    )
+    ctx.enqueue_function[reduce_batch_dim_gate_up_kernel, reduce_batch_dim_gate_up_kernel](
+        grad_gate_partial_dev.unsafe_ptr(),
+        grad_gate_dev.unsafe_ptr(),
+        batch_size,
+        hidden_dim,
+        input_dim,
+        grid_dim=blocks_hd,
+        block_dim=256,
+    )
+    ctx.enqueue_function[reduce_batch_dim_gate_up_kernel, reduce_batch_dim_gate_up_kernel](
+        grad_up_partial_dev.unsafe_ptr(),
+        grad_up_dev.unsafe_ptr(),
+        batch_size,
+        hidden_dim,
+        input_dim,
+        grid_dim=blocks_hd,
+        block_dim=256,
+    )
+    ctx.enqueue_function[reduce_batch_dim_gate_up_kernel, reduce_batch_dim_gate_up_kernel](
+        grad_gate2_partial_dev.unsafe_ptr(),
+        grad_gate2_dev.unsafe_ptr(),
+        batch_size,
+        hidden_dim,
+        hidden_dim,
+        grid_dim=blocks_hhd,
+        block_dim=256,
+    )
+    ctx.enqueue_function[reduce_batch_dim_gate_up_kernel, reduce_batch_dim_gate_up_kernel](
+        grad_up2_partial_dev.unsafe_ptr(),
+        grad_up2_dev.unsafe_ptr(),
+        batch_size,
+        hidden_dim,
+        hidden_dim,
+        grid_dim=blocks_hhd,
+        block_dim=256,
+    )

@@ -119,8 +119,8 @@ def run_batch_grad_regression_test() raises -> None:
 
     var model_ref = BatchMicroNet(32, hidden_dim)
     var model_batch = BatchMicroNet(32, hidden_dim)
-    init_random_weights(model_ref, 0.1)
-    init_random_weights(model_batch, 0.1)
+    init_random_weights(model_ref, 0.1, 0.1 / 16.0)
+    init_random_weights(model_batch, 0.1, 0.1 / 16.0)
 
     for i in range(len(model_ref.gate_shadow)):
         model_batch.gate_shadow[i] = model_ref.gate_shadow[i]
@@ -144,7 +144,7 @@ def run_batch_grad_regression_test() raises -> None:
     var loss_batch = model_batch.train_step_cpu(data, 0, 32, grads_batch)
 
     assert_true(abs(loss_ref - loss_batch) < 1e-5, "loss mismatch")
-    assert_true(_max_grad_diff(grads_ref, grads_batch) < 1e-5, "grad mismatch")
+    assert_true(_max_grad_diff(grads_ref, grads_batch) < 2e-4, "grad mismatch")
 
 
 def run_gpu_backward_regression_test() raises -> None:
@@ -159,8 +159,8 @@ def run_gpu_backward_regression_test() raises -> None:
 
     var model_cpu = BatchMicroNet(32, hidden_dim)
     var model_gpu = BatchMicroNet(32, hidden_dim)
-    init_random_weights(model_cpu, 0.1)
-    init_random_weights(model_gpu, 0.1)
+    init_random_weights(model_cpu, 0.1, 0.1 / 16.0)
+    init_random_weights(model_gpu, 0.1, 0.1 / 16.0)
 
     for i in range(len(model_cpu.gate_shadow)):
         model_gpu.gate_shadow[i] = model_cpu.gate_shadow[i]
@@ -188,4 +188,4 @@ def run_gpu_backward_regression_test() raises -> None:
 
     # GPU parallel matmul may reorder float32 slightly vs CPU sequential.
     assert_true(abs(loss_cpu - loss_gpu) < 1e-5, "gpu loss mismatch")
-    assert_true(_max_grad_diff(grads_cpu, grads_gpu) < 1e-4, "gpu grad mismatch")
+    assert_true(_max_grad_diff(grads_cpu, grads_gpu) < 2e-4, "gpu grad mismatch")

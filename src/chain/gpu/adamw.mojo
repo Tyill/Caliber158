@@ -62,6 +62,36 @@ def adamw_scalar_kernel(
     param[0] -= learning_rate * update
 
 
+def enqueue_adamw_weight_list(
+    ctx: DeviceContext,
+    mut params: DeviceBuffer[DType.float32],
+    grads: DeviceBuffer[DType.float32],
+    mut m: DeviceBuffer[DType.float32],
+    mut v: DeviceBuffer[DType.float32],
+    n: Int,
+    bias_corr1: Float32,
+    bias_corr2: Float32,
+    config: AdamWConfig,
+) raises -> None:
+    var blocks = _ceildiv(n, 256)
+    ctx.enqueue_function[adamw_update_kernel, adamw_update_kernel](
+        params.unsafe_ptr(),
+        grads.unsafe_ptr(),
+        m.unsafe_ptr(),
+        v.unsafe_ptr(),
+        n,
+        bias_corr1,
+        bias_corr2,
+        config.learning_rate,
+        config.beta1,
+        config.beta2,
+        config.eps,
+        config.weight_decay,
+        grid_dim=blocks,
+        block_dim=256,
+    )
+
+
 def enqueue_adamw_apply(
     ctx: DeviceContext,
     mut gate_shadow: DeviceBuffer[DType.float32],

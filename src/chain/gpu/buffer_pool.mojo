@@ -7,12 +7,13 @@ from ..buffer import ChainData
 from ..env import ternary_threshold
 from ..grads import ModelGrads
 from ..micro_net_batch import BatchMicroNet, _ceildiv
-from .adamw import enqueue_adamw_apply
-from .backward import enqueue_backward
+from .adamw import enqueue_adamw_apply, enqueue_adamw_weight_list
+from .backward import enqueue_backward, enqueue_backward_v1
 from .device import GpuDevice, f32_ptr_offset
 from .quantize import enqueue_quantize_ste
 from .ternary_matmul import (
     head_reduce_kernel,
+    scaled_residual_add_kernel,
     scale_kernel,
     swiglu_forward_kernel,
     ternary_matmul_batch_kernel,
@@ -28,6 +29,9 @@ struct GpuTrainState(Movable):
     var max_batch_size: Int
     var gate_size: Int
     var head_size: Int
+    var block2_size: Int
+    var is_v1: Bool
+    var block2_residual_scale: Float32
     var timestep: Int
     var threshold: Float32
 
@@ -36,12 +40,20 @@ struct GpuTrainState(Movable):
     var gate_shadow_dev: DeviceBuffer[DType.float32]
     var up_shadow_dev: DeviceBuffer[DType.float32]
     var head_shadow_dev: DeviceBuffer[DType.float32]
+    var gate2_shadow_dev: DeviceBuffer[DType.float32]
+    var up2_shadow_dev: DeviceBuffer[DType.float32]
     var alpha_dev: DeviceBuffer[DType.float32]
     var gate_tern_dev: DeviceBuffer[DType.int8]
     var up_tern_dev: DeviceBuffer[DType.int8]
     var head_tern_dev: DeviceBuffer[DType.int8]
+    var gate2_tern_dev: DeviceBuffer[DType.int8]
+    var up2_tern_dev: DeviceBuffer[DType.int8]
     var gate_act_dev: DeviceBuffer[DType.float32]
     var up_act_dev: DeviceBuffer[DType.float32]
+    var h1_dev: DeviceBuffer[DType.float32]
+    var gate2_act_dev: DeviceBuffer[DType.float32]
+    var up2_act_dev: DeviceBuffer[DType.float32]
+    var h2_dev: DeviceBuffer[DType.float32]
     var hidden_dev: DeviceBuffer[DType.float32]
     var pred_dev: DeviceBuffer[DType.float32]
     var err_dev: DeviceBuffer[DType.float32]
@@ -49,12 +61,19 @@ struct GpuTrainState(Movable):
     var loss_scalar_dev: DeviceBuffer[DType.float32]
     var grad_gate_dev: DeviceBuffer[DType.float32]
     var grad_up_dev: DeviceBuffer[DType.float32]
+    var grad_gate2_dev: DeviceBuffer[DType.float32]
+    var grad_up2_dev: DeviceBuffer[DType.float32]
     var grad_head_dev: DeviceBuffer[DType.float32]
     var grad_alpha_dev: DeviceBuffer[DType.float32]
     var grad_gate_partial_dev: DeviceBuffer[DType.float32]
     var grad_up_partial_dev: DeviceBuffer[DType.float32]
+    var grad_gate2_partial_dev: DeviceBuffer[DType.float32]
+    var grad_up2_partial_dev: DeviceBuffer[DType.float32]
     var grad_head_partial_dev: DeviceBuffer[DType.float32]
     var grad_alpha_partial_dev: DeviceBuffer[DType.float32]
+    var dlh_dev: DeviceBuffer[DType.float32]
+    var dh1_extra_dev: DeviceBuffer[DType.float32]
+    var dlh1_total_dev: DeviceBuffer[DType.float32]
     var gate_m_dev: DeviceBuffer[DType.float32]
     var gate_v_dev: DeviceBuffer[DType.float32]
     var up_m_dev: DeviceBuffer[DType.float32]
@@ -63,6 +82,10 @@ struct GpuTrainState(Movable):
     var head_v_dev: DeviceBuffer[DType.float32]
     var alpha_m_dev: DeviceBuffer[DType.float32]
     var alpha_v_dev: DeviceBuffer[DType.float32]
+    var gate2_m_dev: DeviceBuffer[DType.float32]
+    var gate2_v_dev: DeviceBuffer[DType.float32]
+    var up2_m_dev: DeviceBuffer[DType.float32]
+    var up2_v_dev: DeviceBuffer[DType.float32]
 
     def __init__(
         out self,
@@ -76,12 +99,16 @@ struct GpuTrainState(Movable):
         self.max_batch_size = max_batch_size
         self.gate_size = model.gate_size()
         self.head_size = model.hidden_dim
+        self.is_v1 = model.arch.is_v1()
+        self.block2_size = model.block2_size()
+        self.block2_residual_scale = model.block2_residual_scale
         self.timestep = 0
         self.threshold = ternary_threshold()
 
         var n_x = data.n_samples * data.input_dim
         var bh = max_batch_size * model.hidden_dim
         var bhd = max_batch_size * model.hidden_dim * model.input_dim
+        var bhh = max_batch_size * model.hidden_dim * model.hidden_dim
 
         self.x_dev = self.gpu.create_device_f32(n_x)
         self.y_dev = self.gpu.create_device_f32(data.n_samples)
@@ -94,6 +121,7 @@ struct GpuTrainState(Movable):
         self.head_tern_dev = self.gpu.create_device_i8(self.head_size)
         self.gate_act_dev = self.gpu.create_device_f32(bh)
         self.up_act_dev = self.gpu.create_device_f32(bh)
+        self.h1_dev = self.gpu.create_device_f32(bh)
         self.hidden_dev = self.gpu.create_device_f32(bh)
         self.pred_dev = self.gpu.create_device_f32(max_batch_size)
         self.err_dev = self.gpu.create_device_f32(max_batch_size)
@@ -116,12 +144,58 @@ struct GpuTrainState(Movable):
         self.alpha_m_dev = self.gpu.create_device_f32(1)
         self.alpha_v_dev = self.gpu.create_device_f32(1)
 
+        if self.is_v1:
+            self.gate2_shadow_dev = self.gpu.create_device_f32(self.block2_size)
+            self.up2_shadow_dev = self.gpu.create_device_f32(self.block2_size)
+            self.gate2_tern_dev = self.gpu.create_device_i8(self.block2_size)
+            self.up2_tern_dev = self.gpu.create_device_i8(self.block2_size)
+            self.gate2_act_dev = self.gpu.create_device_f32(bh)
+            self.up2_act_dev = self.gpu.create_device_f32(bh)
+            self.h2_dev = self.gpu.create_device_f32(bh)
+            self.grad_gate2_dev = self.gpu.create_device_f32(self.block2_size)
+            self.grad_up2_dev = self.gpu.create_device_f32(self.block2_size)
+            self.grad_gate2_partial_dev = self.gpu.create_device_f32(bhh)
+            self.grad_up2_partial_dev = self.gpu.create_device_f32(bhh)
+            self.dlh_dev = self.gpu.create_device_f32(bh)
+            self.dh1_extra_dev = self.gpu.create_device_f32(bh)
+            self.dlh1_total_dev = self.gpu.create_device_f32(bh)
+            self.gate2_m_dev = self.gpu.create_device_f32(self.block2_size)
+            self.gate2_v_dev = self.gpu.create_device_f32(self.block2_size)
+            self.up2_m_dev = self.gpu.create_device_f32(self.block2_size)
+            self.up2_v_dev = self.gpu.create_device_f32(self.block2_size)
+        else:
+            self.gate2_shadow_dev = self.gpu.create_device_f32(1)
+            self.up2_shadow_dev = self.gpu.create_device_f32(1)
+            self.gate2_tern_dev = self.gpu.create_device_i8(1)
+            self.up2_tern_dev = self.gpu.create_device_i8(1)
+            self.gate2_act_dev = self.gpu.create_device_f32(1)
+            self.up2_act_dev = self.gpu.create_device_f32(1)
+            self.h2_dev = self.gpu.create_device_f32(1)
+            self.grad_gate2_dev = self.gpu.create_device_f32(1)
+            self.grad_up2_dev = self.gpu.create_device_f32(1)
+            self.grad_gate2_partial_dev = self.gpu.create_device_f32(1)
+            self.grad_up2_partial_dev = self.gpu.create_device_f32(1)
+            self.dlh_dev = self.gpu.create_device_f32(1)
+            self.dh1_extra_dev = self.gpu.create_device_f32(1)
+            self.dlh1_total_dev = self.gpu.create_device_f32(1)
+            self.gate2_m_dev = self.gpu.create_device_f32(1)
+            self.gate2_v_dev = self.gpu.create_device_f32(1)
+            self.up2_m_dev = self.gpu.create_device_f32(1)
+            self.up2_v_dev = self.gpu.create_device_f32(1)
+
         # One-time upload of dataset and initial weights.
         self.gpu.upload_to_device_f32(data.x_data, 0, self.x_dev, len(data.x_data))
         self.gpu.upload_to_device_f32(data.y_data, 0, self.y_dev, len(data.y_data))
         self.gpu.upload_to_device_f32(model.gate_shadow, 0, self.gate_shadow_dev, self.gate_size)
         self.gpu.upload_to_device_f32(model.up_shadow, 0, self.up_shadow_dev, self.gate_size)
         self.gpu.upload_to_device_f32(model.head_shadow, 0, self.head_shadow_dev, self.head_size)
+        if self.is_v1:
+            self.gpu.upload_to_device_f32(model.gate2_shadow, 0, self.gate2_shadow_dev, self.block2_size)
+            self.gpu.upload_to_device_f32(model.up2_shadow, 0, self.up2_shadow_dev, self.block2_size)
+            self.gpu.zero_f32(self.gate2_m_dev, self.block2_size)
+            self.gpu.zero_f32(self.gate2_v_dev, self.block2_size)
+            self.gpu.zero_f32(self.up2_m_dev, self.block2_size)
+            self.gpu.zero_f32(self.up2_v_dev, self.block2_size)
         var alpha_host = List[Float32](capacity=1)
         alpha_host.append(model.alpha)
         self.gpu.upload_to_device_f32(alpha_host, 0, self.alpha_dev, 1)
@@ -141,6 +215,9 @@ struct GpuTrainState(Movable):
         model.up_shadow = self.gpu.download_f32(self.up_shadow_dev, self.gate_size)
         model.head_shadow = self.gpu.download_f32(self.head_shadow_dev, self.head_size)
         model.alpha = self.gpu.download_scalar_f32(self.alpha_dev)
+        if self.is_v1:
+            model.gate2_shadow = self.gpu.download_f32(self.gate2_shadow_dev, self.block2_size)
+            model.up2_shadow = self.gpu.download_f32(self.up2_shadow_dev, self.block2_size)
 
     def download_grads(self, mut grads: ModelGrads) raises -> None:
         """Download accumulated grads for regression tests."""
@@ -150,6 +227,16 @@ struct GpuTrainState(Movable):
         grads.alpha = self.gpu.download_scalar_f32(self.grad_alpha_dev)
 
     def _enqueue_forward(
+        mut self,
+        start: Int,
+        batch_size: Int,
+    ) raises -> None:
+        if self.is_v1:
+            self._enqueue_forward_v1(start, batch_size)
+        else:
+            self._enqueue_forward_v0(start, batch_size)
+
+    def _enqueue_forward_v0(
         mut self,
         start: Int,
         batch_size: Int,
@@ -205,6 +292,100 @@ struct GpuTrainState(Movable):
             block_dim=256,
         )
 
+    def _enqueue_forward_v1(
+        mut self,
+        start: Int,
+        batch_size: Int,
+    ) raises -> None:
+        var ctx = self.gpu.ctx
+        var bh = batch_size * self.hidden_dim
+        var x_ptr = f32_ptr_offset(self.x_dev.unsafe_ptr(), start * self.input_dim)
+        var matmul_blocks = _ceildiv(bh, 256)
+
+        ctx.enqueue_function[ternary_matmul_batch_kernel, ternary_matmul_batch_kernel](
+            x_ptr,
+            self.gate_tern_dev.unsafe_ptr(),
+            self.gate_act_dev.unsafe_ptr(),
+            batch_size,
+            self.input_dim,
+            self.hidden_dim,
+            grid_dim=matmul_blocks,
+            block_dim=256,
+        )
+        ctx.enqueue_function[ternary_matmul_batch_kernel, ternary_matmul_batch_kernel](
+            x_ptr,
+            self.up_tern_dev.unsafe_ptr(),
+            self.up_act_dev.unsafe_ptr(),
+            batch_size,
+            self.input_dim,
+            self.hidden_dim,
+            grid_dim=matmul_blocks,
+            block_dim=256,
+        )
+        ctx.enqueue_function[swiglu_forward_kernel, swiglu_forward_kernel](
+            self.gate_act_dev.unsafe_ptr(),
+            self.up_act_dev.unsafe_ptr(),
+            self.h1_dev.unsafe_ptr(),
+            batch_size,
+            self.hidden_dim,
+            grid_dim=matmul_blocks,
+            block_dim=256,
+        )
+        ctx.enqueue_function[ternary_matmul_batch_kernel, ternary_matmul_batch_kernel](
+            self.h1_dev.unsafe_ptr(),
+            self.gate2_tern_dev.unsafe_ptr(),
+            self.gate2_act_dev.unsafe_ptr(),
+            batch_size,
+            self.hidden_dim,
+            self.hidden_dim,
+            grid_dim=matmul_blocks,
+            block_dim=256,
+        )
+        ctx.enqueue_function[ternary_matmul_batch_kernel, ternary_matmul_batch_kernel](
+            self.h1_dev.unsafe_ptr(),
+            self.up2_tern_dev.unsafe_ptr(),
+            self.up2_act_dev.unsafe_ptr(),
+            batch_size,
+            self.hidden_dim,
+            self.hidden_dim,
+            grid_dim=matmul_blocks,
+            block_dim=256,
+        )
+        ctx.enqueue_function[swiglu_forward_kernel, swiglu_forward_kernel](
+            self.gate2_act_dev.unsafe_ptr(),
+            self.up2_act_dev.unsafe_ptr(),
+            self.h2_dev.unsafe_ptr(),
+            batch_size,
+            self.hidden_dim,
+            grid_dim=matmul_blocks,
+            block_dim=256,
+        )
+        ctx.enqueue_function[scaled_residual_add_kernel, scaled_residual_add_kernel](
+            self.h1_dev.unsafe_ptr(),
+            self.h2_dev.unsafe_ptr(),
+            self.hidden_dev.unsafe_ptr(),
+            self.block2_residual_scale,
+            bh,
+            grid_dim=matmul_blocks,
+            block_dim=256,
+        )
+        ctx.enqueue_function[head_reduce_kernel, head_reduce_kernel](
+            self.hidden_dev.unsafe_ptr(),
+            self.head_tern_dev.unsafe_ptr(),
+            self.pred_dev.unsafe_ptr(),
+            batch_size,
+            self.hidden_dim,
+            grid_dim=batch_size,
+            block_dim=1,
+        )
+        ctx.enqueue_function[scale_kernel, scale_kernel](
+            self.pred_dev.unsafe_ptr(),
+            self.alpha_dev.unsafe_ptr(),
+            batch_size,
+            grid_dim=_ceildiv(batch_size, 256),
+            block_dim=256,
+        )
+
     def _enqueue_quantize(mut self) raises -> None:
         var ctx = self.gpu.ctx
         enqueue_quantize_ste(
@@ -216,45 +397,101 @@ struct GpuTrainState(Movable):
         enqueue_quantize_ste(
             ctx, self.head_shadow_dev, self.head_tern_dev, self.head_size, self.threshold
         )
+        if self.is_v1:
+            enqueue_quantize_ste(
+                ctx, self.gate2_shadow_dev, self.gate2_tern_dev, self.block2_size, self.threshold
+            )
+            enqueue_quantize_ste(
+                ctx, self.up2_shadow_dev, self.up2_tern_dev, self.block2_size, self.threshold
+            )
 
     def _zero_grads(mut self) raises -> None:
         self.gpu.zero_f32(self.grad_gate_dev, self.gate_size)
         self.gpu.zero_f32(self.grad_up_dev, self.gate_size)
         self.gpu.zero_f32(self.grad_head_dev, self.head_size)
         self.gpu.zero_f32(self.grad_alpha_dev, 1)
+        if self.is_v1:
+            self.gpu.zero_f32(self.grad_gate2_dev, self.block2_size)
+            self.gpu.zero_f32(self.grad_up2_dev, self.block2_size)
+
+    def _enqueue_backward(mut self, start: Int, batch_size: Int) raises -> None:
+        if self.is_v1:
+            enqueue_backward_v1(
+                self.gpu.ctx,
+                self.x_dev,
+                start * self.input_dim,
+                self.y_dev,
+                start,
+                self.gate_act_dev,
+                self.up_act_dev,
+                self.h1_dev,
+                self.gate2_act_dev,
+                self.up2_act_dev,
+                self.h2_dev,
+                self.hidden_dev,
+                self.pred_dev,
+                self.head_tern_dev,
+                self.gate2_tern_dev,
+                self.up2_tern_dev,
+                self.alpha_dev,
+                self.err_dev,
+                self.loss_partial_dev,
+                self.grad_alpha_partial_dev,
+                self.grad_head_partial_dev,
+                self.grad_gate_partial_dev,
+                self.grad_up_partial_dev,
+                self.grad_gate2_partial_dev,
+                self.grad_up2_partial_dev,
+                self.grad_gate_dev,
+                self.grad_up_dev,
+                self.grad_gate2_dev,
+                self.grad_up2_dev,
+                self.grad_head_dev,
+                self.grad_alpha_dev,
+                self.dlh_dev,
+                self.dh1_extra_dev,
+                self.dlh1_total_dev,
+                self.loss_scalar_dev,
+                batch_size,
+                self.hidden_dim,
+                self.input_dim,
+                self.block2_residual_scale,
+            )
+        else:
+            enqueue_backward(
+                self.gpu.ctx,
+                self.x_dev,
+                start * self.input_dim,
+                self.y_dev,
+                start,
+                self.gate_act_dev,
+                self.up_act_dev,
+                self.hidden_dev,
+                self.pred_dev,
+                self.head_tern_dev,
+                self.alpha_dev,
+                self.err_dev,
+                self.loss_partial_dev,
+                self.grad_alpha_partial_dev,
+                self.grad_head_partial_dev,
+                self.grad_gate_partial_dev,
+                self.grad_up_partial_dev,
+                self.grad_gate_dev,
+                self.grad_up_dev,
+                self.grad_head_dev,
+                self.grad_alpha_dev,
+                self.loss_scalar_dev,
+                batch_size,
+                self.hidden_dim,
+                self.input_dim,
+            )
 
     def backward_only(mut self, start: Int, batch_size: Int) raises -> Float32:
         """Forward + backward without AdamW (for grad regression)."""
         self._enqueue_quantize()
         self._enqueue_forward(start, batch_size)
         self._zero_grads()
-        enqueue_backward(
-            self.gpu.ctx,
-            self.x_dev,
-            start * self.input_dim,
-            self.y_dev,
-            start,
-            self.gate_act_dev,
-            self.up_act_dev,
-            self.hidden_dev,
-            self.pred_dev,
-            self.head_tern_dev,
-            self.alpha_dev,
-            self.err_dev,
-            self.loss_partial_dev,
-            self.grad_alpha_partial_dev,
-            self.grad_head_partial_dev,
-            self.grad_gate_partial_dev,
-            self.grad_up_partial_dev,
-            self.grad_gate_dev,
-            self.grad_up_dev,
-            self.grad_head_dev,
-            self.grad_alpha_dev,
-            self.loss_scalar_dev,
-            batch_size,
-            self.hidden_dim,
-            self.input_dim,
-        )
+        self._enqueue_backward(start, batch_size)
         self.gpu.synchronize()
         return self.gpu.download_scalar_f32(self.loss_scalar_dev)
 
@@ -263,33 +500,7 @@ struct GpuTrainState(Movable):
         self._enqueue_quantize()
         self._enqueue_forward(start, batch_size)
         self._zero_grads()
-        enqueue_backward(
-            self.gpu.ctx,
-            self.x_dev,
-            start * self.input_dim,
-            self.y_dev,
-            start,
-            self.gate_act_dev,
-            self.up_act_dev,
-            self.hidden_dev,
-            self.pred_dev,
-            self.head_tern_dev,
-            self.alpha_dev,
-            self.err_dev,
-            self.loss_partial_dev,
-            self.grad_alpha_partial_dev,
-            self.grad_head_partial_dev,
-            self.grad_gate_partial_dev,
-            self.grad_up_partial_dev,
-            self.grad_gate_dev,
-            self.grad_up_dev,
-            self.grad_head_dev,
-            self.grad_alpha_dev,
-            self.loss_scalar_dev,
-            batch_size,
-            self.hidden_dim,
-            self.input_dim,
-        )
+        self._enqueue_backward(start, batch_size)
 
         self.timestep += 1
         var bias_corr1 = one_minus_pow(config.beta1, self.timestep)
@@ -318,5 +529,28 @@ struct GpuTrainState(Movable):
             bias_corr2,
             config,
         )
+        if self.is_v1:
+            enqueue_adamw_weight_list(
+                self.gpu.ctx,
+                self.gate2_shadow_dev,
+                self.grad_gate2_dev,
+                self.gate2_m_dev,
+                self.gate2_v_dev,
+                self.block2_size,
+                bias_corr1,
+                bias_corr2,
+                config,
+            )
+            enqueue_adamw_weight_list(
+                self.gpu.ctx,
+                self.up2_shadow_dev,
+                self.grad_up2_dev,
+                self.up2_m_dev,
+                self.up2_v_dev,
+                self.block2_size,
+                bias_corr1,
+                bias_corr2,
+                config,
+            )
         self.gpu.synchronize()
         return self.gpu.download_scalar_f32(self.loss_scalar_dev)

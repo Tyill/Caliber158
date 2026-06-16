@@ -94,3 +94,43 @@ def scale_kernel(
     if i >= n:
         return
     values[i] = values[i] * scale[0]
+
+
+def scaled_residual_add_kernel(
+    h1: UnsafePointer[Float32, MutAnyOrigin],
+    h2: UnsafePointer[Float32, MutAnyOrigin],
+    dst: UnsafePointer[Float32, MutAnyOrigin],
+    residual_scale: Float32,
+    n: Int,
+):
+    """dst[i] = h1[i] + residual_scale * h2[i]."""
+    var i = Int(block_idx.x * block_dim.x + thread_idx.x)
+    if i >= n:
+        return
+    dst[i] = h1[i] + residual_scale * h2[i]
+
+
+def residual_add_kernel(
+    h1: UnsafePointer[Float32, MutAnyOrigin],
+    h2: UnsafePointer[Float32, MutAnyOrigin],
+    dst: UnsafePointer[Float32, MutAnyOrigin],
+    n: Int,
+):
+    """dst[i] = h1[i] + h2[i]."""
+    var i = Int(block_idx.x * block_dim.x + thread_idx.x)
+    if i >= n:
+        return
+    dst[i] = h1[i] + h2[i]
+
+
+def vector_add_kernel(
+    a: UnsafePointer[Float32, MutAnyOrigin],
+    b: UnsafePointer[Float32, MutAnyOrigin],
+    dst: UnsafePointer[Float32, MutAnyOrigin],
+    n: Int,
+):
+    """dst[i] = a[i] + b[i]."""
+    var i = Int(block_idx.x * block_dim.x + thread_idx.x)
+    if i >= n:
+        return
+    dst[i] = a[i] + b[i]

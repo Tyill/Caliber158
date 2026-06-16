@@ -23,6 +23,10 @@ struct AdamWState(Copyable, Movable):
     var up_v: List[Float32]
     var head_m: List[Float32]
     var head_v: List[Float32]
+    var gate2_m: List[Float32]
+    var gate2_v: List[Float32]
+    var up2_m: List[Float32]
+    var up2_v: List[Float32]
     var alpha_m: Float32
     var alpha_v: Float32
     var timestep: Int
@@ -35,6 +39,10 @@ struct AdamWState(Copyable, Movable):
         var up_v = List[Float32](capacity=len(model.up_shadow))
         var head_m = List[Float32](capacity=len(model.head_shadow))
         var head_v = List[Float32](capacity=len(model.head_shadow))
+        var gate2_m = List[Float32](capacity=len(model.gate2_shadow))
+        var gate2_v = List[Float32](capacity=len(model.gate2_shadow))
+        var up2_m = List[Float32](capacity=len(model.up2_shadow))
+        var up2_v = List[Float32](capacity=len(model.up2_shadow))
 
         for _ in range(len(model.gate_shadow)):
             gate_m.append(0.0)
@@ -45,8 +53,28 @@ struct AdamWState(Copyable, Movable):
         for _ in range(len(model.head_shadow)):
             head_m.append(0.0)
             head_v.append(0.0)
+        for _ in range(len(model.gate2_shadow)):
+            gate2_m.append(0.0)
+            gate2_v.append(0.0)
+        for _ in range(len(model.up2_shadow)):
+            up2_m.append(0.0)
+            up2_v.append(0.0)
 
-        return AdamWState(gate_m^, gate_v^, up_m^, up_v^, head_m^, head_v^, 0.0, 0.0, 0)
+        return AdamWState(
+            gate_m^,
+            gate_v^,
+            up_m^,
+            up_v^,
+            head_m^,
+            head_v^,
+            gate2_m^,
+            gate2_v^,
+            up2_m^,
+            up2_v^,
+            0.0,
+            0.0,
+            0,
+        )
 
     def apply(
         mut self,
@@ -85,6 +113,25 @@ struct AdamWState(Copyable, Movable):
             bias_corr2,
             config,
         )
+        if model.arch.is_v1():
+            _adamw_update_list(
+                model.gate2_shadow,
+                grads.gate2,
+                self.gate2_m,
+                self.gate2_v,
+                bias_corr1,
+                bias_corr2,
+                config,
+            )
+            _adamw_update_list(
+                model.up2_shadow,
+                grads.up2,
+                self.up2_m,
+                self.up2_v,
+                bias_corr1,
+                bias_corr2,
+                config,
+            )
         _adamw_update_scalar(
             model.alpha,
             grads.alpha,

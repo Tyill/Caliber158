@@ -1,6 +1,6 @@
 # Handoff для следующего чата
 
-Обновлено: 2026-06-16 (GPU v2 сделан)
+Обновлено: 2026-06-16 (v1 GPU + holdout; v1 train нестабилен)
 
 ## Идея проекта
 
@@ -30,7 +30,7 @@
 - Загрузка: `scripts/load-env.sh` + `python/env_config.py`
 - Mojo: `src/chain/env.mojo` (`TrainEnv.load()`)
 
-Ключевые env (student): `HIDDEN_DIM`, `DATASET`, `EPOCHS`, `BATCH_SIZE`, `LR`, **`DEVICE`** (`cuda`|`cpu`), **`TRAIN_BACKEND=mojo`**.
+Ключевые env (student): `ARCH` (`v0`|`v1`), `HIDDEN_DIM`, `DATASET`, `EPOCHS`, `BATCH_SIZE`, `LR`, `HOLDOUT_FRACTION`, `INIT_SCALE`, `INIT_SCALE_BLOCK2` (опц.), `BLOCK2_RESIDUAL_SCALE` (опц.), **`DEVICE`** (`cuda`|`cpu`), **`TRAIN_BACKEND=mojo`**.
 
 Teacher: `TORCH=cuda|cpu`, `MODEL`, `SAMPLES`, `LAYER`, `NEURON`, …
 
@@ -40,52 +40,71 @@ Teacher: `TORCH=cuda|cpu`, `MODEL`, `SAMPLES`, `LAYER`, `NEURON`, …
 - `CALIBER158_TORCH=cuda` — extract на GPU ок
 - Кэш: `models/huggingface/`
 
-### Mojo (student) — батч + полный GPU train (v2)
+### Mojo (student) — батч + полный GPU train (v2) + arch v1
+
+**Архитектуры (`CALIBER158_ARCH`, `src/chain/arch.mojo`):**
+
+| Arch | Топология |
+|------|-----------|
+| **v0** | один SwiGLU `D→H` → head → α |
+| **v1** | block1 `D→H` → h1; block2 `H→H` → h2; **h = h1 + scale·h2** → head → α |
 
 **Архитектура train (один путь, sample-by-sample удалён):**
 
 | Модуль | Роль |
 |--------|------|
+| `arch.mojo` | `ArchKind` v0/v1 |
+| `holdout.mojo`, `metrics.mojo` | 90/10 split (LCG seed), `Var(Y)`, `rel_holdout` |
 | `buffer.mojo` | `ChainData` — dense `X`/`Y` на host; один upload в GPU при старте train |
-| `micro_net_batch.mojo` | `BatchMicroNet` — `train_step_cpu()` (CPU path) |
-| `gpu/buffer_pool.mojo` | **`GpuTrainState`** — persistent device buffers (~75–85 MB при B=64, H=128, D=896) |
+| `micro_net_batch.mojo` | `BatchMicroNet` — v0/v1 CPU forward/backward + `eval_mse()` |
+| `gpu/buffer_pool.mojo` | **`GpuTrainState`** — v0 + **v1** (block2 buffers, scaled residual) |
 | `gpu/device.mojo` | upload/download, zero, pointer offset, Float64 reduce |
 | `gpu/quantize.mojo` | STE quantize shadow → ternary на device |
-| `gpu/ternary_matmul.mojo` | CUDA: ternary matmul, SwiGLU, head reduce, scale(`alpha_dev`) |
-| `gpu/backward.mojo` | STE backward: partial `[B×H×D]` / `[B×H]` + reduce по B (без atomics) |
-| `gpu/adamw.mojo` | AdamW на device (shadow + `alpha_dev` + `m`/`v`) |
+| `gpu/ternary_matmul.mojo` | CUDA: ternary matmul, SwiGLU, **scaled_residual_add**, head, scale(α) |
+| `gpu/backward.mojo` | v0 `enqueue_backward`; **v1 `enqueue_backward_v1`** (residual + block2) |
+| `gpu/adamw.mojo` | AdamW на device; **gate2/up2** через `enqueue_adamw_weight_list` |
 | `gpu/batch_step.mojo` | `train_step_gpu()` — quantize → forward → backward → AdamW |
-| `train.mojo` | `_train_epochs_cpu` / `_train_epochs_gpu` (`GpuTrainState` один раз на train) |
-| `adamw.mojo` | AdamW на host — **только CPU path** |
+| `train.mojo` | holdout в логе; `download_shadow` перед holdout eval на GPU |
+| `adamw.mojo` | AdamW на host — CPU path (+ gate2/up2 для v1) |
 | `device.mojo` | `DeviceKind`, `resolve_device_from_env()` |
-| `test_batch_grad.mojo` | CPU regression + `run_gpu_backward_regression_test()` |
+| `test_batch_grad.mojo` | CPU regression + `run_gpu_backward_regression_test()` (v0) |
+
+**v1 block2 scaling (ternary STE):**
+
+- `CALIBER158_INIT_SCALE_BLOCK2` — shadow init gate2/up2; default `INIT_SCALE / HIDDEN_DIM`
+- `CALIBER158_BLOCK2_RESIDUAL_SCALE` — множитель **h2** в `h = h1 + scale·h2`; default `1 / HIDDEN_DIM`
+- Без residual scale малый shadow init **не помогает**: после STE все ненулевые веса → ±1
 
 Удалено: `micro_net.mojo` (`accumulate_grad`, sample-by-sample).
 
 **GPU v2 hot loop (`device=cuda`):**
 
 ```
-quantize → forward (x_dev offset, alpha_dev) → backward → AdamW
+quantize → forward (v0 или v1) → backward → AdamW
 ```
 
 - Shadow weights + optimizer state — **source of truth на GPU**
-- `BatchMicroNet` на host — только `init_random_weights`; опц. `download_shadow()` позже для checkpoint
-- В hot loop host не участвует в backward/AdamW; только scalar loss download для лога `mse=`
+- `BatchMicroNet` на host — `init_random_weights`; `download_shadow()` перед holdout eval
+- В hot loop host не участвует в backward/AdamW; scalar loss download для лога
 
 **Проверено:**
 
 - `make test` — green (`build` 0 warnings + `test-grad` + `smoke` на CUDA path)
-- `make test-grad` — CPU batch vs reference, `max|grad_diff| < 1e-5`
-- `make test-grad-gpu` — CPU vs GPU backward, loss `< 1e-5`, grads `< 1e-4` (float32 reorder в parallel matmul)
-- `make smoke` / `make smoke-cuda` — MSE падает на synthetic
-- **`make train-cuda`** на `L00_N0000.bin` (4096, RTX 3050 Ti): 10 epochs **~5 с** (было ~59 с в v1); MSE `44.6M → 9.9M` (≈ v1: `44.6M → 9.3M`)
-- Compile + run требуют видимый NVIDIA GPU (`sm_86` ок для 3050 Ti)
+- `make test-grad` — CPU batch vs reference, grads `< 2e-4`
+- `make test-grad-gpu` — CPU vs GPU backward v0, loss `< 1e-5`, grads `< 1e-4`
+- **v0 `make train-cuda`**, `L00_N0000.bin`, H=512, **30 epochs** (~45 с, 3050 Ti):
+  - train_mse → **~0.032**, holdout_mse → **~0.038**, **rel_holdout ≈ 1.04** (underfit, ≈ `Var(Y)`)
+  - **10 epochs недостаточно** — на ep 9 MSE ещё ~10⁶; плато к ~ep 27
+- **v1 GPU train** — компилируется и бежит, но **не сходится** (см. `lerning_comprare.md`)
+- v1 CPU vs GPU один батч — loss совпадает (kernels ок)
 
-### Уже прогнано пользователем
+### Уже прогнано
 
 - `data/chains/L00_N0000.bin` (14 MB) + `L00_N0000.json`, 4096 samples
-- Старый CPU sample-by-sample train: ~4+ мин/epoch 0, прервано (`mse≈4.46e7`)
-- GPU v1 train: ~59 с / 10 epochs (до v2)
+- Holdout 90/10: **3687 train / 409 holdout** (`CALIBER158_SEED=42`)
+- **v0 GPU**, H=512/128, 30 ep: плато `rel_holdout ≈ 1` (underfit)
+- **v1 GPU**, H=512/128, 30 ep: loss **взрывается** (~10¹²–10²⁵) — см. **`lerning_comprare.md`**
+- Сравнение v0/v1 на H=128 задокументировано в `lerning_comprare.md`
 
 ### Важно: PyTorch ≠ student
 
@@ -96,30 +115,42 @@ quantize → forward (x_dev offset, alpha_dev) → backward → AdamW
 
 ## Текущая фаза
 
-**Phase 1**: одна цепочка `L00_N0000` — **дообучить до конца** и оценить качество.
+**Phase 1**: одна цепочка `L00_N0000` — стабилизировать **v1** и улучшить качество **v0**.
 
-Критерий успеха: holdout MSE < 1e-4 (или < 0.1% от `Var(Y_qwen)`).
+Критерий успеха: holdout `rel_holdout < 0.001` (или MSE < 1e-4).
 
-GPU v2 закрыт по скорости; **следующий приоритет — качество**, не перенос на device.
+- **v0 GPU**: сходится к `Var(Y)` за ~**30 epochs** (`rel_holdout ≈ 1`) — underfit
+- **v1 GPU**: hot loop готов, но train **не сходится** (H=128 и H=512)
+- На **10 epochs** v0 выглядит «плохо» (MSE ~10⁶) — это норма до плато
 
 ---
 
 ## Что делать дальше (приоритет)
 
-### 1. Качество Phase 1 — **следующий шаг**
+### 1. Обучение v1 — что попробовать
 
-- **Holdout split** + relative MSE vs `Var(Y)`
-- Тюнинг: `HIDDEN_DIM` 256/512, больше `EPOCHS`, re-extract с `SAMPLES=100000`
+| # | Эксперимент | Зачем |
+|---|-------------|--------|
+| 1 | Sweep `BLOCK2_RESIDUAL_SCALE` (`1/H²`, `1e-5`, …) | STE → ±1; нужен меньший вклад h2 |
+| 2 | Отдельный LR / weight decay для block2 | block2 может разгонять AdamW |
+| 3 | `test-grad-gpu-v1` в gate | CPU vs GPU v1, один батч |
+| 4 | `BLOCK2_RESIDUAL_SCALE=0` | sanity: должен ≈ v0 |
+| 5 | Float shadow для block2 (без STE) | проверить, учится ли block2; **меняет контракт** |
+| 6 | Pre-norm на h1 перед block2 | стабилизация активаций |
+| 7 | Bottleneck H→H/k→H вместо H→H | меньше fan-in |
+
+Сравнение прогонов: **`lerning_comprare.md`**.
+
+### 2. Качество v0 (baseline)
+
+- `EPOCHS=30` в `.env` (минимум для плато)
+- Re-extract `SAMPLES=100000`
+- Тюнинг `HIDDEN_DIM` 256/512
 - **Checkpoint export** (см. ниже)
 
-### 2. Checkpoint export (нет в коде)
+### 3. Checkpoint export (нет в коде)
 
-После успешного train — сохранять gate/up/head ternary, shadow (опц.), α, chain_id → `data/checkpoints/L00_N0000.bin` (формат не спроектирован). На GPU path: `GpuTrainState.download_shadow()` уже есть для чтения весов с device.
-
-### 3. Метрики качества
-
-- Relative MSE vs `Var(Y)`
-- `pred` vs teacher на holdout
+После успешного train — gate/up/head (+ gate2/up2 для v1), shadow, α → `data/checkpoints/`. `GpuTrainState.download_shadow()` уже есть.
 
 ### 4. Phase 2 — batch extract layer 0
 
@@ -183,7 +214,8 @@ make test-grad-gpu     # CPU vs GPU backward (нужен CUDA runtime)
 ## Известные ограничения / техдолг
 
 - README не синхронизирован с кодом (см. выше)
-- Нет holdout, нет checkpoint I/O, нет batch extract pipeline
+- v1 train нестабилен; нет `test-grad-gpu-v1` в gate
+- Нет checkpoint I/O, нет batch extract pipeline
 - `mojo build` требует **видимый NVIDIA GPU** при compile (CI workaround — v2.1)
 - `make test` не включает `test-grad-gpu` (runtime GPU); build всё равно тянет GPU-модули
 - GPU grad regression: допуск **1e-4** (не 1e-5) из‑за float32 reorder в parallel matmul
@@ -203,11 +235,11 @@ make test-grad-gpu     # CPU vs GPU backward (нужен CUDA runtime)
 | `alpha_dev` в forward/backward/AdamW | ✅ |
 | `make test` green, 0 warnings | ✅ |
 | `make test-grad-gpu` | ✅ (grad `< 1e-4`, loss `< 1e-5`) |
-| `make train-cuda` 10 epochs на `L00_N0000.bin` | ✅ **~5 с** (3050 Ti) |
-| MSE curve ≈ GPU v1 | ✅ 44.6M → 9.9M |
-| Нет per-batch upload весов/`X` | ✅ один upload at start |
-| Checkpoint export | ❌ |
-| Holdout | ❌ |
+| `make train-cuda` v0, 30 ep, `L00_N0000.bin` | ✅ rel_holdout ≈ 1 |
+| v1 GPU forward/backward/AdamW | ✅ |
+| v1 train сходится | ❌ |
+| Holdout + `rel_holdout` в логе | ✅ |
+| `lerning_comprare.md` (v0 vs v1 H=128) | ✅ |
 | Teacher `make extract` без регрессии | ✅ (код не менялся) |
 
 ---
@@ -221,6 +253,7 @@ Caliber158/
 ├── main.mojo
 ├── pixi.toml             # mojo + max
 ├── src/chain/
+│   ├── arch.mojo, holdout.mojo, metrics.mojo
 │   ├── buffer.mojo
 │   ├── micro_net_batch.mojo
 │   ├── train.mojo, adamw.mojo, dataset.mojo, env.mojo, device.mojo
@@ -238,5 +271,6 @@ Caliber158/
 ├── scripts/
 ├── docs/
 ├── data/chains/          # L00_N0000.bin + .json (generated)
+├── lerning_comprare.md   # v0 vs v1 train curves
 └── models/huggingface/
 ```
