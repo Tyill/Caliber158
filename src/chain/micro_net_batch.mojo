@@ -19,12 +19,14 @@ struct BatchMicroNet(Copyable, Movable):
     var head_ternary: List[TernaryWeight]
     var _gate_buf: List[Float32]
     var _up_buf: List[Float32]
+    var use_ternary: Bool
 
     def __init__(
         out self,
         input_dim: Int,
         hidden_dim: Int,
         alpha: Float32 = 1.0,
+        use_ternary: Bool = True,
     ) raises:
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -50,6 +52,7 @@ struct BatchMicroNet(Copyable, Movable):
             self.head_ternary.append(0)
 
         self.alpha = alpha
+        self.use_ternary = use_ternary
         self._gate_buf = List[Float32](capacity=hidden_dim)
         self._up_buf = List[Float32](capacity=hidden_dim)
         for _ in range(hidden_dim):
@@ -76,7 +79,8 @@ struct BatchMicroNet(Copyable, Movable):
         if count == 0:
             return 0.0
 
-        self.sync_ternary()
+        if self.use_ternary:
+            self.sync_ternary()
         grads.zero()
 
         var inv_batch = 1.0 / Float32(count)
@@ -86,29 +90,50 @@ struct BatchMicroNet(Copyable, Movable):
             var x_base = data.x_offset(sample)
             var target = data.y_at(sample)
 
-            _ternary_matvec_rowmajor(
-                self.gate_ternary,
-                data.x_data,
-                x_base,
-                self.input_dim,
-                self.hidden_dim,
-                self._gate_buf,
-            )
-            _ternary_matvec_rowmajor(
-                self.up_ternary,
-                data.x_data,
-                x_base,
-                self.input_dim,
-                self.hidden_dim,
-                self._up_buf,
-            )
+            if self.use_ternary:
+                _ternary_matvec_rowmajor(
+                    self.gate_ternary,
+                    data.x_data,
+                    x_base,
+                    self.input_dim,
+                    self.hidden_dim,
+                    self._gate_buf,
+                )
+                _ternary_matvec_rowmajor(
+                    self.up_ternary,
+                    data.x_data,
+                    x_base,
+                    self.input_dim,
+                    self.hidden_dim,
+                    self._up_buf,
+                )
+            else:
+                _float_matvec_rowmajor(
+                    self.gate_shadow,
+                    data.x_data,
+                    x_base,
+                    self.input_dim,
+                    self.hidden_dim,
+                    self._gate_buf,
+                )
+                _float_matvec_rowmajor(
+                    self.up_shadow,
+                    data.x_data,
+                    x_base,
+                    self.input_dim,
+                    self.hidden_dim,
+                    self._up_buf,
+                )
 
             var y_tern: Float32 = 0.0
             for j in range(self.hidden_dim):
                 var h = silu(self._gate_buf[j]) * self._up_buf[j]
-                var w = self.head_ternary[j]
-                if w != 0:
-                    y_tern += Float32(w) * h
+                if self.use_ternary:
+                    var w = self.head_ternary[j]
+                    if w != 0:
+                        y_tern += Float32(w) * h
+                else:
+                    y_tern += self.head_shadow[j] * h
 
             var pred = self.alpha * y_tern
             var err = pred - target
@@ -126,7 +151,12 @@ struct BatchMicroNet(Copyable, Movable):
 
                 grads.head[j] += dL_dy_tern * h_j
 
-                var dL_dh = dL_dy_tern * Float32(self.head_ternary[j])
+                var head_w = (
+                    Float32(self.head_ternary[j])
+                    if self.use_ternary
+                    else self.head_shadow[j]
+                )
+                var dL_dh = dL_dy_tern * head_w
                 var dL_dgate = dL_dh * up_j * silu_derivative(gate_j)
                 var dL_dup = dL_dh * silu_gate
 
@@ -146,7 +176,8 @@ struct BatchMicroNet(Copyable, Movable):
         if data.n_samples == 0:
             return 0.0
 
-        self.sync_ternary()
+        if self.use_ternary:
+            self.sync_ternary()
         var loss: Float32 = 0.0
         var inv_n = 1.0 / Float32(data.n_samples)
 
@@ -160,29 +191,50 @@ struct BatchMicroNet(Copyable, Movable):
     def _predict_at(mut self, data: ChainData, sample: Int) -> Float32:
         var x_base = data.x_offset(sample)
 
-        _ternary_matvec_rowmajor(
-            self.gate_ternary,
-            data.x_data,
-            x_base,
-            self.input_dim,
-            self.hidden_dim,
-            self._gate_buf,
-        )
-        _ternary_matvec_rowmajor(
-            self.up_ternary,
-            data.x_data,
-            x_base,
-            self.input_dim,
-            self.hidden_dim,
-            self._up_buf,
-        )
+        if self.use_ternary:
+            _ternary_matvec_rowmajor(
+                self.gate_ternary,
+                data.x_data,
+                x_base,
+                self.input_dim,
+                self.hidden_dim,
+                self._gate_buf,
+            )
+            _ternary_matvec_rowmajor(
+                self.up_ternary,
+                data.x_data,
+                x_base,
+                self.input_dim,
+                self.hidden_dim,
+                self._up_buf,
+            )
+        else:
+            _float_matvec_rowmajor(
+                self.gate_shadow,
+                data.x_data,
+                x_base,
+                self.input_dim,
+                self.hidden_dim,
+                self._gate_buf,
+            )
+            _float_matvec_rowmajor(
+                self.up_shadow,
+                data.x_data,
+                x_base,
+                self.input_dim,
+                self.hidden_dim,
+                self._up_buf,
+            )
 
         var y_tern: Float32 = 0.0
         for j in range(self.hidden_dim):
             var h = silu(self._gate_buf[j]) * self._up_buf[j]
-            var w = self.head_ternary[j]
-            if w != 0:
-                y_tern += Float32(w) * h
+            if self.use_ternary:
+                var w = self.head_ternary[j]
+                if w != 0:
+                    y_tern += Float32(w) * h
+            else:
+                y_tern += self.head_shadow[j] * h
 
         return self.alpha * y_tern
 
@@ -207,4 +259,21 @@ def _ternary_matvec_rowmajor(
             var w = weights[row_base + i]
             if w != 0:
                 acc += Float32(w) * input[input_base + i]
+        output[j] = acc
+
+
+def _float_matvec_rowmajor(
+    weights: List[Float32],
+    input: List[Float32],
+    input_base: Int,
+    in_dim: Int,
+    out_dim: Int,
+    mut output: List[Float32],
+) -> None:
+    """y[j] = sum_i W[j,i] * x[i] with FP32 shadow weights."""
+    for j in range(out_dim):
+        var acc: Float32 = 0.0
+        var row_base = j * in_dim
+        for i in range(in_dim):
+            acc += weights[row_base + i] * input[input_base + i]
         output[j] = acc

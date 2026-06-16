@@ -46,6 +46,30 @@ def ternary_matmul_batch_kernel(
     output[idx] = acc
 
 
+def float_matmul_batch_kernel(
+    x: UnsafePointer[Float32, MutAnyOrigin],
+    w: UnsafePointer[Float32, MutAnyOrigin],
+    output: UnsafePointer[Float32, MutAnyOrigin],
+    batch_size: Int,
+    in_dim: Int,
+    hidden_dim: Int,
+):
+    """output[b,j] = sum_i w[j,i] * x[b,i] with FP32 weights."""
+    var idx = Int(block_idx.x * block_dim.x + thread_idx.x)
+    var total = batch_size * hidden_dim
+    if idx >= total:
+        return
+
+    var b = idx // hidden_dim
+    var j = idx % hidden_dim
+    var acc: Float32 = 0.0
+    var x_base = b * in_dim
+    var w_row = j * in_dim
+    for i in range(in_dim):
+        acc += w[w_row + i] * x[x_base + i]
+    output[idx] = acc
+
+
 def swiglu_forward_kernel(
     gate: UnsafePointer[Float32, MutAnyOrigin],
     up: UnsafePointer[Float32, MutAnyOrigin],
@@ -82,6 +106,27 @@ def head_reduce_kernel(
         if w != 0:
             total += Float32(w) * hidden[h_base + j]
     y_tern[b] = total
+
+
+def head_reduce_f32_kernel(
+    hidden: UnsafePointer[Float32, MutAnyOrigin],
+    head: UnsafePointer[Float32, MutAnyOrigin],
+    y_out: UnsafePointer[Float32, MutAnyOrigin],
+    batch_size: Int,
+    hidden_dim: Int,
+):
+    """y_out[b] = sum_j head[j] * hidden[b,j]. One block per batch row."""
+    var b = Int(block_idx.x)
+    if b >= batch_size:
+        return
+    if thread_idx.x != 0:
+        return
+
+    var total: Float32 = 0.0
+    var h_base = b * hidden_dim
+    for j in range(hidden_dim):
+        total += head[j] * hidden[h_base + j]
+    y_out[b] = total
 
 
 def scale_kernel(

@@ -133,6 +133,8 @@ def train_chain(
         " device=",
         config.device.label() if use_gpu else DeviceKind.cpu().label(),
         " backend=mojo",
+        " quantize=",
+        "ternary" if model.use_ternary else "fp32",
     )
     if holdout.holdout.n_samples > 0:
         print(

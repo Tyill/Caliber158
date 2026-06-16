@@ -8,10 +8,12 @@ from ..env import ternary_threshold
 from ..grads import ModelGrads
 from ..micro_net_batch import BatchMicroNet, _ceildiv
 from .adamw import enqueue_adamw_apply
-from .backward import enqueue_backward
+from .backward import enqueue_backward, enqueue_backward_fp32
 from .device import GpuDevice, f32_ptr_offset
 from .quantize import enqueue_quantize_ste
 from .ternary_matmul import (
+    float_matmul_batch_kernel,
+    head_reduce_f32_kernel,
     head_reduce_kernel,
     scale_kernel,
     swiglu_forward_kernel,
@@ -30,6 +32,7 @@ struct GpuTrainState(Movable):
     var head_size: Int
     var timestep: Int
     var threshold: Float32
+    var use_ternary: Bool
 
     var x_dev: DeviceBuffer[DType.float32]
     var y_dev: DeviceBuffer[DType.float32]
@@ -78,6 +81,7 @@ struct GpuTrainState(Movable):
         self.head_size = model.hidden_dim
         self.timestep = 0
         self.threshold = ternary_threshold()
+        self.use_ternary = model.use_ternary
 
         var n_x = data.n_samples * data.input_dim
         var bh = max_batch_size * model.hidden_dim
@@ -205,6 +209,62 @@ struct GpuTrainState(Movable):
             block_dim=256,
         )
 
+    def _enqueue_forward_fp32(
+        mut self,
+        start: Int,
+        batch_size: Int,
+    ) raises -> None:
+        var ctx = self.gpu.ctx
+        var bh = batch_size * self.hidden_dim
+        var x_ptr = f32_ptr_offset(self.x_dev.unsafe_ptr(), start * self.input_dim)
+
+        var matmul_blocks = _ceildiv(bh, 256)
+        ctx.enqueue_function[float_matmul_batch_kernel, float_matmul_batch_kernel](
+            x_ptr,
+            self.gate_shadow_dev.unsafe_ptr(),
+            self.gate_act_dev.unsafe_ptr(),
+            batch_size,
+            self.input_dim,
+            self.hidden_dim,
+            grid_dim=matmul_blocks,
+            block_dim=256,
+        )
+        ctx.enqueue_function[float_matmul_batch_kernel, float_matmul_batch_kernel](
+            x_ptr,
+            self.up_shadow_dev.unsafe_ptr(),
+            self.up_act_dev.unsafe_ptr(),
+            batch_size,
+            self.input_dim,
+            self.hidden_dim,
+            grid_dim=matmul_blocks,
+            block_dim=256,
+        )
+        ctx.enqueue_function[swiglu_forward_kernel, swiglu_forward_kernel](
+            self.gate_act_dev.unsafe_ptr(),
+            self.up_act_dev.unsafe_ptr(),
+            self.hidden_dev.unsafe_ptr(),
+            batch_size,
+            self.hidden_dim,
+            grid_dim=matmul_blocks,
+            block_dim=256,
+        )
+        ctx.enqueue_function[head_reduce_f32_kernel, head_reduce_f32_kernel](
+            self.hidden_dev.unsafe_ptr(),
+            self.head_shadow_dev.unsafe_ptr(),
+            self.pred_dev.unsafe_ptr(),
+            batch_size,
+            self.hidden_dim,
+            grid_dim=batch_size,
+            block_dim=1,
+        )
+        ctx.enqueue_function[scale_kernel, scale_kernel](
+            self.pred_dev.unsafe_ptr(),
+            self.alpha_dev.unsafe_ptr(),
+            batch_size,
+            grid_dim=_ceildiv(batch_size, 256),
+            block_dim=256,
+        )
+
     def _enqueue_quantize(mut self) raises -> None:
         var ctx = self.gpu.ctx
         enqueue_quantize_ste(
@@ -225,71 +285,135 @@ struct GpuTrainState(Movable):
 
     def backward_only(mut self, start: Int, batch_size: Int) raises -> Float32:
         """Forward + backward without AdamW (for grad regression)."""
-        self._enqueue_quantize()
-        self._enqueue_forward(start, batch_size)
+        if self.use_ternary:
+            self._enqueue_quantize()
+            self._enqueue_forward(start, batch_size)
+        else:
+            self._enqueue_forward_fp32(start, batch_size)
         self._zero_grads()
-        enqueue_backward(
-            self.gpu.ctx,
-            self.x_dev,
-            start * self.input_dim,
-            self.y_dev,
-            start,
-            self.gate_act_dev,
-            self.up_act_dev,
-            self.hidden_dev,
-            self.pred_dev,
-            self.head_tern_dev,
-            self.alpha_dev,
-            self.err_dev,
-            self.loss_partial_dev,
-            self.grad_alpha_partial_dev,
-            self.grad_head_partial_dev,
-            self.grad_gate_partial_dev,
-            self.grad_up_partial_dev,
-            self.grad_gate_dev,
-            self.grad_up_dev,
-            self.grad_head_dev,
-            self.grad_alpha_dev,
-            self.loss_scalar_dev,
-            batch_size,
-            self.hidden_dim,
-            self.input_dim,
-        )
+        if self.use_ternary:
+            enqueue_backward(
+                self.gpu.ctx,
+                self.x_dev,
+                start * self.input_dim,
+                self.y_dev,
+                start,
+                self.gate_act_dev,
+                self.up_act_dev,
+                self.hidden_dev,
+                self.pred_dev,
+                self.head_tern_dev,
+                self.alpha_dev,
+                self.err_dev,
+                self.loss_partial_dev,
+                self.grad_alpha_partial_dev,
+                self.grad_head_partial_dev,
+                self.grad_gate_partial_dev,
+                self.grad_up_partial_dev,
+                self.grad_gate_dev,
+                self.grad_up_dev,
+                self.grad_head_dev,
+                self.grad_alpha_dev,
+                self.loss_scalar_dev,
+                batch_size,
+                self.hidden_dim,
+                self.input_dim,
+            )
+        else:
+            enqueue_backward_fp32(
+                self.gpu.ctx,
+                self.x_dev,
+                start * self.input_dim,
+                self.y_dev,
+                start,
+                self.gate_act_dev,
+                self.up_act_dev,
+                self.hidden_dev,
+                self.pred_dev,
+                self.head_shadow_dev,
+                self.alpha_dev,
+                self.err_dev,
+                self.loss_partial_dev,
+                self.grad_alpha_partial_dev,
+                self.grad_head_partial_dev,
+                self.grad_gate_partial_dev,
+                self.grad_up_partial_dev,
+                self.grad_gate_dev,
+                self.grad_up_dev,
+                self.grad_head_dev,
+                self.grad_alpha_dev,
+                self.loss_scalar_dev,
+                batch_size,
+                self.hidden_dim,
+                self.input_dim,
+            )
         self.gpu.synchronize()
         return self.gpu.download_scalar_f32(self.loss_scalar_dev)
 
     def train_step(mut self, start: Int, batch_size: Int, config: AdamWConfig) raises -> Float32:
-        """Full GPU train step: quantize, forward, backward, AdamW."""
-        self._enqueue_quantize()
-        self._enqueue_forward(start, batch_size)
+        """Full GPU train step: quantize (optional), forward, backward, AdamW."""
+        if self.use_ternary:
+            self._enqueue_quantize()
+            self._enqueue_forward(start, batch_size)
+        else:
+            self._enqueue_forward_fp32(start, batch_size)
         self._zero_grads()
-        enqueue_backward(
-            self.gpu.ctx,
-            self.x_dev,
-            start * self.input_dim,
-            self.y_dev,
-            start,
-            self.gate_act_dev,
-            self.up_act_dev,
-            self.hidden_dev,
-            self.pred_dev,
-            self.head_tern_dev,
-            self.alpha_dev,
-            self.err_dev,
-            self.loss_partial_dev,
-            self.grad_alpha_partial_dev,
-            self.grad_head_partial_dev,
-            self.grad_gate_partial_dev,
-            self.grad_up_partial_dev,
-            self.grad_gate_dev,
-            self.grad_up_dev,
-            self.grad_head_dev,
-            self.grad_alpha_dev,
-            self.loss_scalar_dev,
-            batch_size,
-            self.hidden_dim,
-            self.input_dim,
-        )
+        if self.use_ternary:
+            enqueue_backward(
+                self.gpu.ctx,
+                self.x_dev,
+                start * self.input_dim,
+                self.y_dev,
+                start,
+                self.gate_act_dev,
+                self.up_act_dev,
+                self.hidden_dev,
+                self.pred_dev,
+                self.head_tern_dev,
+                self.alpha_dev,
+                self.err_dev,
+                self.loss_partial_dev,
+                self.grad_alpha_partial_dev,
+                self.grad_head_partial_dev,
+                self.grad_gate_partial_dev,
+                self.grad_up_partial_dev,
+                self.grad_gate_dev,
+                self.grad_up_dev,
+                self.grad_head_dev,
+                self.grad_alpha_dev,
+                self.loss_scalar_dev,
+                batch_size,
+                self.hidden_dim,
+                self.input_dim,
+            )
+        else:
+            enqueue_backward_fp32(
+                self.gpu.ctx,
+                self.x_dev,
+                start * self.input_dim,
+                self.y_dev,
+                start,
+                self.gate_act_dev,
+                self.up_act_dev,
+                self.hidden_dev,
+                self.pred_dev,
+                self.head_shadow_dev,
+                self.alpha_dev,
+                self.err_dev,
+                self.loss_partial_dev,
+                self.grad_alpha_partial_dev,
+                self.grad_head_partial_dev,
+                self.grad_gate_partial_dev,
+                self.grad_up_partial_dev,
+                self.grad_gate_dev,
+                self.grad_up_dev,
+                self.grad_head_dev,
+                self.grad_alpha_dev,
+                self.loss_scalar_dev,
+                batch_size,
+                self.hidden_dim,
+                self.input_dim,
+            )
 
         self.timestep += 1
         var bias_corr1 = one_minus_pow(config.beta1, self.timestep)

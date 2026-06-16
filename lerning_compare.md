@@ -142,6 +142,36 @@
 
 ---
 
+### 5b. GPU, H=512, 30 epochs + holdout — FP32 v0 diagnostic ✅
+
+| Параметр | Значение |
+|----------|----------|
+| `HIDDEN_DIM` | 512 |
+| `EPOCHS` | 30 |
+| `LR` | 0.003 |
+| `WEIGHT_DECAY` | 0.001 |
+| `HOLDOUT_FRACTION` | 0.1 (`SEED=42`) |
+| `CALIBER158_QUANTIZE` | **0** (shadow FP32, без STE ternary) |
+| Split | **3687 train / 409 holdout** |
+
+| Epoch | train_mse | holdout_mse | rel_holdout |
+|-------|-----------|-------------|-------------|
+| 0 | 3.19 | 0.470 | 12.7 |
+| 5 | 3.14 | 0.140 | 3.76 |
+| 16 | 11.3 | 0.0467 | 1.26 |
+| 18 | 0.158 | 0.0372 | 1.00 |
+| 29 | **0.0327** | **0.0372** | **1.004** |
+
+| | |
+|--|--|
+| Wall time | ~36 с |
+| Финал holdout `rel` | **1.004** |
+| vs ternary #5 | **≈ то же плато** (1.04 vs 1.004) |
+
+**Вывод:** без ternary та же shallow v0 arch → underfit сохраняется → bottleneck в **ёмкости архитектуры**, не в quantize/STE. Обоснование для v1.
+
+---
+
 ## Сводная таблица (финальные метрики)
 
 | Прогон | H | Epochs | Train MSE | Holdout MSE | rel_holdout | Время |
@@ -151,6 +181,7 @@
 | GPU | 256 | 50 | 0.0329 | — | ~0.99* | ~17 с |
 | GPU | 512 | 100 | 0.0325 | — | ~0.98* | ~50 с |
 | **GPU + holdout** | **512** | **30** | **0.0321** | **0.0384** | **1.04** | **~45 с** |
+| **FP32 v0 + holdout** | **512** | **30** | **0.0327** | **0.0372** | **1.004** | **~36 с** |
 
 \* train MSE / Var(Y), holdout не измерялся
 
@@ -161,7 +192,8 @@
 1. **GPU train** дал ускорение с минут до ~45 с на 30 epochs (512 hidden).
 2. **Рост `HIDDEN_DIM`** 128 → 256 дал огромный скачок; 256 → 512 почти не помог.
 3. **Holdout ≈ train** на плато (`rel ~ 1.0`) → **underfit**, не overfit. Модель не выучивает teacher, а предсказывает ~среднее `Y`.
-4. **Дальше:** архитектура v1 (второй SwiGLU-блок + residual) или диагностика FP32 без ternary; не гиперпараметры.
+4. **FP32 diagnostic (#5b):** `rel_holdout ≈ 1.004` — как ternary → узкое место **ёмкость v0**, не ternary.
+5. **Дальше:** архитектура v1 (второй SwiGLU-блок + residual); не гиперпараметры.
 
 ---
 
@@ -171,4 +203,7 @@
 make train-cuda
 # env: CALIBER158_HIDDEN_DIM=512, EPOCHS=30, LR=0.003,
 #      WEIGHT_DECAY=0.001, HOLDOUT_FRACTION=0.1, SEED=42
+
+# FP32 diagnostic (v0, no ternary quantize):
+CALIBER158_QUANTIZE=0 make train-cuda
 ```

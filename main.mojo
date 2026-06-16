@@ -18,6 +18,7 @@ def print_info(env: TrainEnv) -> None:
     print("  dataset   :", env.dataset_path)
     print("  device    :", env.device.label())
     print("  backend   :", env.train_backend)
+    print("  quantize  :", "ternary" if env.use_ternary else "fp32 (CALIBER158_QUANTIZE=0)")
     print()
     print("Config: copy .env.example → .env, or export CALIBER158_* vars.")
     print("Usage:")
@@ -54,7 +55,7 @@ def run_train(dataset_path: String, hidden_dim: Int, env: TrainEnv) raises -> No
             env.hidden_size,
         )
 
-    var model = BatchMicroNet(dataset.input_dim, hidden_dim)
+    var model = BatchMicroNet(dataset.input_dim, hidden_dim, use_ternary=env.use_ternary)
     init_random_weights(model, env.init_scale)
 
     var split = split_holdout(data, env.holdout_fraction, env.split_seed)
@@ -112,7 +113,7 @@ def main() raises:
             hidden_dim = Int(args[2])
         var dataset = ChainDataset.synthetic(env.smoke_samples, env.hidden_size)
         var data = ChainData.from_dataset(dataset)
-        var model = BatchMicroNet(env.hidden_size, hidden_dim)
+        var model = BatchMicroNet(env.hidden_size, hidden_dim, use_ternary=env.use_ternary)
         init_random_weights(model, env.init_scale)
         train_chain(
             model,

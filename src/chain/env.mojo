@@ -28,6 +28,7 @@ struct TrainEnv(Copyable, Movable):
     var train_backend: String
     var holdout_fraction: Float32
     var split_seed: UInt64
+    var use_ternary: Bool
 
     @staticmethod
     def load() raises -> TrainEnv:
@@ -53,11 +54,18 @@ struct TrainEnv(Copyable, Movable):
             train_backend=train_backend_from_env(),
             holdout_fraction=_env_float("CALIBER158_HOLDOUT_FRACTION", 0.1),
             split_seed=UInt64(_env_int("CALIBER158_SEED", 42)),
+            use_ternary=_env_use_ternary(),
         )
 
 
 def ternary_threshold() -> Float32:
     return _env_float("CALIBER158_TERNARY_THRESHOLD", 0.0)
+
+
+def _env_use_ternary() -> Bool:
+    """CALIBER158_QUANTIZE=0 disables STE ternary (FP32 shadow diagnostic)."""
+    var raw = getenv("CALIBER158_QUANTIZE", "1")
+    return raw != "0"
 
 
 def _env_string(key: String, default: String) -> String:
