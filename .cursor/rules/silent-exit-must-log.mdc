@@ -1,0 +1,28 @@
+---
+description: Silent failure paths must log before returning without outward signal
+alwaysApply: true
+---
+
+# Silent exit on failure — always log
+
+## Hard rule
+
+If execution hits a failure path (error, reject, invalid state, unexpected empty/None, rollback, encode failure, swallowed error with no client/host response) and **nothing goes outward** (no payload, no error event, no callback, no published message) — **do not return silently without a log**.
+
+- Call a meaningful log helper **before** the silent return.
+- Log message: short context (what was attempted, which branch), public-safe identifiers only, no secrets, no internal-only ids in user-facing logs.
+
+## What is not a failure
+
+- Expected idempotency or race (another worker already handled it): either a low-noise diagnostic log or an explicit code comment why no log is intentional (rare).
+- Success path where silence is normal (no-op merge, empty optional side-effect).
+
+## On edits
+
+When adding or changing **error / reject -> silence** branches, add logging immediately. Review diffs for new silent failures without logs.
+
+## Do not spam happy path
+
+- Do not log inside hot loops per frame/poll/successful message unless behind a debug flag.
+- Do not log expected no-ops when there is no failure — logs become noise under load.
+- Invariant: **failure / reject -> log**; **normal skip -> no log** unless rare diagnostic scenario.

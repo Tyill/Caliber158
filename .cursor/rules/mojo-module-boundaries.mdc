@@ -1,0 +1,34 @@
+---
+description: Layer imports — public API through module entrypoints, keep kernel/host/ffi separated
+alwaysApply: true
+---
+
+# Mojo Module Boundaries
+
+Keep layers explicit as the repo grows. Adjust names to your tree; the rule is **direction of dependency**, not a specific folder spelling.
+
+## Suggested layers
+
+| Layer | Role | May import from |
+|-------|------|-----------------|
+| **kernel** | hot numeric/SIMD core, no I/O | stdlib, other kernel helpers |
+| **domain** | types, invariants, pure logic | kernel (if needed), domain |
+| **host** | CLI, orchestration, file/network | domain, kernel public API |
+| **ffi** | Python/C ABI adapters | domain/kernel through narrow facades |
+| **generated** | codegen output | nothing imports "up" into hand-written domain |
+
+## Import rule
+
+From outside a layer, import only through that layer's **public entry** (`__init__.mojo`, `public.mojo`, or documented `Main`-style module) — not deep internal files.
+
+Inside a layer, submodules may import each other per local design.
+
+## Do not
+
+- Reach from kernel into host I/O or Python.
+- Put wire decode (proto/JSON) inside SIMD inner loops — decode at boundary, pass typed values inward.
+- Duplicate domain types at ffi boundary; convert once at the edge.
+
+## When adding a check script
+
+If the repo adds `make check-module-boundaries` or similar, update it when layer layout changes — same spirit as boundary checks in larger backends.

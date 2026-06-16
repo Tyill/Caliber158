@@ -1,0 +1,29 @@
+---
+description: Mojo edits must pass targeted build/test with zero warnings before full gate
+globs: "**/*.mojo"
+alwaysApply: false
+---
+
+# Mojo Build And Check Discipline
+
+After Mojo edits, run the narrowest relevant checks first:
+
+- `mojo build <file_or_target>`
+- `mojo test <module_or_path>` for touched tests
+- project `make check-*` or `pixi run check-*` if present
+
+Before commit: full repo test gate once, green, 0 warnings.
+
+## Zero warnings
+
+- Do not leave compiler warnings "for later".
+- Do not hide warnings with blanket suppressions without fixing root cause.
+
+## Manifest sync
+
+- New modules belong in the agreed layout and are referenced from `mojo.toml`, package exports, or Makefile targets as the project defines.
+- Remove dead modules from manifests when deleting code.
+
+## Debug workflow
+
+On build failure: read the first error, fix root cause, rebuild the smallest target that covers the change before running the full gate.

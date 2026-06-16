@@ -1,0 +1,33 @@
+---
+description: FFI and Python boundary — ownership, lifetimes, explicit error propagation
+globs: "**/*.{mojo,py}"
+alwaysApply: false
+---
+
+# Mojo FFI And Host Boundary Safety
+
+## Ownership and lifetimes
+
+- Document who owns buffers passed across Mojo ↔ Python/C++.
+- Do not return pointers/handles to stack or temporaries across the boundary.
+- Prefer copying or explicit lifetime contract over "it worked once in a test".
+- After host calls into Mojo, assume host may retain references — design APIs accordingly.
+
+## Typed boundary
+
+- Convert wire/host primitives to domain types **at the boundary**, not deep inside kernel code.
+- Do not leak raw indices/handles into public Python API when opaque ids exist.
+
+## Errors
+
+- Do not swallow FFI failures silently — log and return explicit error to host (exception, error code, Result).
+- See **silent-exit-must-log** for paths that return without outward signal.
+
+## GIL / threading (Python host)
+
+- If calling from Python threads, document whether Mojo entrypoints are re-entrant and whether GIL rules apply.
+- No hidden global mutable state in kernel without explicit sync story.
+
+## Protected changes
+
+Changing FFI function signatures or ABI layout requires explicit user approval — see **changes-and-proposals**.

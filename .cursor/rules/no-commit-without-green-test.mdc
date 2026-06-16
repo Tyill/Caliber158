@@ -1,0 +1,35 @@
+---
+description: 'HARD: no git commit until the repo test gate is green'
+alwaysApply: true
+---
+
+# No Commit Without Green Test Gate
+
+## Hard
+
+**Do not `git commit` until the repository test gate exits 0.**
+
+Default gate (override in README if project defines another):
+
+```bash
+make test
+```
+
+If there is no Makefile yet, use the documented equivalent (`pixi run test`, `mojo test` on full suite, CI-local script) — but the rule stays: **full gate green before commit**.
+
+No exceptions:
+
+- do not commit "only our diff" while gate is red;
+- do not cite "already broken on branch", "not our file", "someone else is fixing" — **green gate first, then commit**;
+- do not tell the user commit succeeded if full gate was not green immediately before.
+
+## Order
+
+1. Iteration — targeted checks as you edit.
+2. **Right before commit** — one full gate run at repo root.
+3. If red — fix until green; commit only after.
+4. User explicitly asks for commit — still green gate first.
+
+## If commit happened on red gate
+
+Do not repeat. Tell the user. Fix tests; new commit/amend only on explicit request and again after green gate.

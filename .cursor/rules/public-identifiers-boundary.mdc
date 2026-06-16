@@ -1,0 +1,26 @@
+---
+description: External API exposes opaque/public ids; internal representation stays inside service/DB layer
+alwaysApply: true
+---
+
+# Public / Internal Identifiers Boundary
+
+One line: internal ids (DB UUID, row pk, internal handles) stay inside the service/storage layer; wire, events, logs shown to operators, and host-facing API use **public opaque identifiers** only.
+
+## Wire, events, host API
+
+- Treat `*_id`, `id`, tokens on wire as **opaque strings**, not internal storage keys.
+- Do not serialize internal UUIDs/int pk into client payloads, event streams, or user-visible errors/logs.
+- Do not expose role/account internal keys in client payload; use opaque tokens if role selection is needed.
+
+Existing field names need not be renamed for cosmetics: if the project already documents `user_id` as public opaque on wire, keep the name — enforce the boundary in code.
+
+## Decode / encode boundary
+
+- Decode: accept public opaque id on wire, resolve to internal id locally inside storage/service layer.
+- Encode/publish: emit only public opaque values.
+- Domain/kernel pure code should not carry wire-specific proto types — mapping lives at encode/decode boundary.
+
+## External identity
+
+If integrating OAuth/provider ids: raw `external_user_id` maps to internal `person_id` (or equivalent) in one identity table; domain mutations use internal id, not provider string in business tables.

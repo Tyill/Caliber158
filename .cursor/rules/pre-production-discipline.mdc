@@ -1,0 +1,32 @@
+---
+description: 'Pre-production: one contract, no compatibility fallback, zero warnings, no dead code'
+alwaysApply: true
+---
+
+# Pre-production Discipline
+
+Production is not live yet. Breaking changes in API, wire formats, config, and internal contracts are allowed without backward compatibility.
+
+## No fallback
+
+- Do not add compatibility fallback: old format support, default instead of a required field, first matching variant, soft degradation, or "for later" workarounds.
+- One explicit contract and one branch by meaning; preconditions not met -> explicit failure (`Error`, `raise`, validation error, typed reject).
+- Do not fork one business operation into alternate code paths with different semantics.
+- If fallback is ever explicitly allowed, mark it with `FALLBACK(reason)` and note when to remove it. Do not add new fallback without user request.
+
+## Tests do not dictate API
+
+- Design new code from the product model, not from the shape of old tests.
+- Do not add `Optional`, extra parameters, shims, or branches only to keep old tests unchanged.
+- Update tests to match the new contract.
+
+## Zero warnings
+
+- `mojo build`, `mojo test`, `pixi run …`, repo check scripts: **0 warnings**.
+- Do not suppress warnings with flags without fixing the cause.
+- Keep modules listed in the project manifest (`mojo.toml`, `pixi.toml`, Makefile targets) in sync with the tree.
+
+## No dead code
+
+Remove unused imports, args, vars, functions, types, commented-out old code, unreachable branches, and stale stubs/fallback.
+If an argument must stay for an external interface/callback, prefix with `_` and briefly explain why.

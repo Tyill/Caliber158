@@ -1,0 +1,24 @@
+---
+description: New env vars and config are explicit, documented, and verified in the relevant flow
+alwaysApply: true
+---
+
+# Config And Env Contracts
+
+Treat env and config changes as part of the project API.
+
+Rules:
+
+- do not add a new env var without explicit name, meaning, and usage site;
+- decide immediately: required or default;
+- do not duplicate overlapping env vars;
+- when config changes, update README, `mojo.toml`, `pixi.toml`, Makefile, smoke scripts, or local docs as applicable;
+- if env/config is used in integration or smoke flow, verify that flow — not just compilation;
+- error messages for missing required env must be clear and actionable.
+
+Common touchpoints (adjust per repo layout):
+
+- `mojo.toml`, `pixi.toml`
+- `Makefile`, `scripts/`
+- host Python package config
+- README setup section

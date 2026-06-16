@@ -1,0 +1,27 @@
+# Pixi / conda env
+.pixi/
+
+# Mojo build artifacts
+*.mojoc
+main
+
+# Dataset and checkpoints (generated)
+data/*.bin
+data/*.npz
+data/checkpoints/
+
+# Downloaded teacher weights (HuggingFace cache)
+models/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

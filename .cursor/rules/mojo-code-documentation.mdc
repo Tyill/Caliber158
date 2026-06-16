@@ -1,0 +1,27 @@
+---
+description: Doc comments on public structs, fields, and non-obvious function signatures
+globs: "**/*.mojo"
+alwaysApply: false
+---
+
+# Mojo Code Documentation
+
+## Public functions
+
+Non-obvious public functions and exported entrypoints: doc comment with purpose, parameter meaning, return/error behavior.
+
+Short obvious helpers may stay undocumented if name and types are sufficient.
+
+## Struct fields
+
+Named struct fields that are not self-explanatory: inline comment or doc — semantics, units, valid ranges, opaque vs internal id.
+
+## Enums and aliases
+
+Domain enums and type aliases: one-line comment on what each variant/alias means when not obvious from the name.
+
+## Module layout (soft guide)
+
+- Top: imports, public API, types, constants.
+- Bottom or near use: private helpers that serve specific functions above.
+- Do not reorder entire files for aesthetics only; apply on new edits where it helps the next reader.

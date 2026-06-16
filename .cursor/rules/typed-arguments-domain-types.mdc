@@ -1,0 +1,30 @@
+---
+description: Use domain types in signatures, not raw primitives where semantics already exist
+alwaysApply: true
+---
+
+# Function arguments: domain types, not raw numbers and strings
+
+## Hard rule
+
+In domain, kernel, host, and service-layer signatures, use **existing project types** when they express parameter meaning — not bare `Int`, `Int64`, `Float64`, `String` when the domain already has a type for that value.
+
+Do not represent the same meaning twice in one call chain (e.g. separate `String` operation name and separate command enum) — **one** source of truth.
+
+## What counts as an existing type
+
+- Money, counts with units, tensor shapes, batch sizes → dedicated struct/alias/newtype, not "just int".
+- Command/operation name → enum or typed alias, not free `String` for routing/audit where enum exists.
+- Public vs internal identifiers → separate opaque types at domain boundary, not bare `String` id in public APIs.
+- Device/backend selection → enum or config type, not string literals in hot path.
+
+## Where primitives are OK
+
+- **Wire / SQL / FFI boundary**: raw fields as in the contract; convert to domain type immediately after decode/read.
+- Sequence indices, buffer sizes, technical counters with no separate domain type yet.
+- If no suitable type exists yet — introduce one deliberately (**pre-production-discipline**) or keep primitive with a clear parameter name until a second meaning appears.
+
+## Related rules
+
+- **no-hardcoded-magic**: do not replace missing typed parameters with constants.
+- **domain-optional-and-wire-strings**: optionality and wire string validation are separate concerns.

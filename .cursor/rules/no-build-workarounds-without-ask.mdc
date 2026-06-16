@@ -1,0 +1,29 @@
+---
+description: HARD — no architectural workarounds for green build; explain blocker and wait for decision
+alwaysApply: true
+---
+
+# Build and checks: no workarounds — ask first
+
+**Hard:** if `mojo build`, `mojo test`, `make test`, `make check*`, import cycles, or any other check **fails**, and the "quick fix" needs an **architectural workaround** — **do not apply it**. Stop, explain the blocker, wait for user decision.
+
+## What counts as a workaround (examples)
+
+- New modules outside the accepted layer layout only to break an import cycle or satisfy a boundary check.
+- Moving types/logic to the wrong module to satisfy a checker, not domain design.
+- Duplicating code instead of a proper import/shared helper.
+- Expanding linter carve-outs or weakening check scripts without explicit "yes" (see **no-linter-changes-without-permission**).
+- Barrel re-exports that break layer boundaries.
+- Any "builds now, architecture drifts" fix — same spirit as **no-hardcoded-magic**, **pre-production-discipline**.
+
+## What to do instead
+
+1. **Capture the blocker** — concrete error (file, module, check name, cycle).
+2. **Explain why** the straight path is blocked (1–3 sentences).
+3. **Offer 2–3 options** with trade-offs — do not choose for the user.
+4. **Wait** for explicit decision before workaround, linter edit, or disputed design.
+
+## Allowed without separate yes
+
+- Direct fix in the correct layer: import, type, export, test, doc — if not a boundary bypass.
+- Application code changes to pass **existing** checks.

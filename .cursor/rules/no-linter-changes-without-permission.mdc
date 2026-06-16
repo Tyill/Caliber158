@@ -1,0 +1,21 @@
+---
+description: Do not modify repo linters or check scripts without explicit user permission
+alwaysApply: true
+---
+
+# Linters and checks: user permission required
+
+**Hard:** do not change linters, boundary-check scripts, or their exception lists **without explicit user permission in the same chat**.
+
+This includes:
+
+- any `scripts/check_*`, `tools/lint/`, CI lint config, or custom boundary validators;
+- edits whose only goal is to make the repo pass by weakening the linter instead of fixing product code.
+
+If a fix seems to require linter change or a new carve-out:
+
+1. **Do not edit** the linter on your own.
+2. Briefly explain to the user why it is needed.
+3. **Ask permission**; after explicit "yes" — apply the change.
+
+Fixing **application code** (Mojo, Python host, SQL, etc.) to pass existing checks is allowed and expected without separate linter permission.

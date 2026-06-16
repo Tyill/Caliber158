@@ -1,0 +1,24 @@
+---
+description: Do not read huge generated artifacts wholesale; use sources or narrow slices
+alwaysApply: true
+---
+
+# Generated Artifacts Reading
+
+Do not load huge/generated artifacts wholesale into context. Use source specs, contracts, targeted search, or narrow slices.
+
+## Avoid reading whole files
+
+- `build/**`, `.mojo-cache/**`, `__pycache__/**`
+- generated bindings (`*_generated.*`, `gen/**`, vendor stubs)
+- large benchmark outputs, profiling dumps, tensor dumps
+- full CI artifact archives
+- duplicated codegen from `.proto` / schema tools
+
+## Read instead
+
+- hand-written source: `**/*.mojo`, host Python, `.proto`, format docs under `docs/`
+- code around the callsite/import/error
+- generated files: only the exact symbol/file/range needed for a compile or import error
+
+For large JSON/logs from checks, use targeted `jq` / `rg` / line ranges — never dump entire files into context.

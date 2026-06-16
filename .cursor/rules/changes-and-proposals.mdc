@@ -1,0 +1,21 @@
+---
+description: Reason about proposals first; protected contract edits need explicit yes before patching
+alwaysApply: true
+---
+
+# Changes And Proposals
+
+If the user proposes a design/approach/feature, think through consequences, edge cases, compatibility with code/docs, and alternatives first. State the conclusion briefly. Implement only after that.
+
+Exception: if the user already says "do / implement / fix" for a concrete task, that is permission for that task.
+
+## Protected edits need explicit yes
+
+Before the edits below, describe what changes, why, which files/modules, and rollout risks if relevant. Do not patch until explicit "yes / do it / ok".
+
+- **Wire/API contracts**: `.proto`, OpenAPI, JSON schema, public `.mojo` module exports intended as stable API.
+- **FFI surface**: Python extension module ABI, C ABI headers, callback signatures shared with host.
+- **Persisted/binary formats**: on-disk layouts, checkpoint blobs, custom serialization versions.
+- **Breaking config/env renames** documented as part of the public setup contract.
+
+After approval, change only the agreed scope. Do not expand scope silently.

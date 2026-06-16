@@ -1,0 +1,10 @@
+---
+description: Agent Skills for this project live only inside the repository tree
+alwaysApply: true
+---
+
+# Skills: repository placement
+
+- Create new Agent Skills for this project only under **`<repo>/.cursor/skills/<skill-name>/SKILL.md`** (and nested files for that skill).
+- Do **not** create or suggest personal skills in `~/.cursor/skills/` unless the user explicitly asks.
+- On move or duplicate: source of truth is **`.cursor/skills/`** at the repository root.

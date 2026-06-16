@@ -1,0 +1,26 @@
+---
+description: No hardcoded magic constants where data should come from caller, config, or wire
+alwaysApply: true
+---
+
+# No hardcoded magic
+
+## Rule
+
+In application/kernel/host code, **do not** substitute missing data or bypass contracts with **constants and magic** that should come from above: function parameters, domain types, config/env, wire decode, runtime context, or explicit enums.
+
+## What counts as magic (examples)
+
+- Hardcoded business ids, roles, device names, enum wire values instead of passing them from the caller or model.
+- Literals duplicating what already exists in a struct, request, DB row, or protocol field — only to make something compile.
+- Duplicating "production semantics later" without an explicit parameter or type.
+
+## What to do instead
+
+- **Thread** the value through arguments, struct fields, or pipeline context from the source of truth higher in the stack.
+- If there is no source yet — **extend the contract** explicitly (type, field, config load, wire field), do not patch with a constant in the callee.
+
+## Related rules
+
+- **pre-production-discipline**: no "just in case" fallback; same for hardcoded values.
+- **changes-and-proposals**: extend wire/API contracts explicitly before patching call sites with literals.

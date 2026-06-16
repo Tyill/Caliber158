@@ -1,0 +1,26 @@
+---
+description: Git commit discipline and test gate before commit
+alwaysApply: true
+---
+
+# Git And Tests
+
+## Commits
+
+- Do not use `git commit --trailer` or wrappers that inject trailers.
+- Use plain `git commit -m` / `git commit -F`.
+- If commit wrapper breaks, use plumbing:
+
+```bash
+TREE=$(git write-tree)
+PARENT=$(git rev-parse HEAD)
+COMMIT=$(printf "%s" "$MSG" | git commit-tree "$TREE" -p "$PARENT" -F -)
+git update-ref HEAD "$COMMIT" "$PARENT"
+git reset --quiet
+```
+
+## Tests before commit
+
+**Hard:** see **no-commit-without-green-test.mdc** — no commit until the repo test gate is green.
+
+While iterating: run targeted checks (`mojo build`, `mojo test <target>`, specific `make check-*`). Run the full gate exactly once immediately before commit.

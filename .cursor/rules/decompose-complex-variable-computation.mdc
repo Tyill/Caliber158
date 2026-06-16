@@ -1,0 +1,11 @@
+---
+description: Extract non-trivial variable computations into named functions
+alwaysApply: true
+---
+
+# Variable computation: no sprawling branches
+
+- Do not put long branching logic directly at the assignment site.
+- If a variable needs many `if`/`match` steps or lots of context, extract the computation into a nearby function in the same module.
+- If the same computation appears in multiple places, move it to a shared helper module for that layer.
+- Name extracted functions by **what they compute**, not by how they compute it.

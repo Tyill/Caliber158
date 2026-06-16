@@ -1,0 +1,44 @@
+---
+description: Prefer sum types over Optional in domain; validate required wire strings after normalize
+alwaysApply: true
+---
+
+# Domain optionality and wire strings
+
+## Prefer defined types over Optional
+
+### Default rule
+
+- **`Optional[T]` in domain types, commands, and public APIs is not the default** — use only when absence is real separate semantics (true optionality, lazy init, safe lookup, etc.).
+- Model state with **defined types**, not "anything or nothing":
+  - enum / tagged union instead of flag + Optional;
+  - struct/newtype with invariant instead of raw type + checks everywhere;
+  - **typed error / Result** when "no value" is expected rejection (validation, business rule);
+  - for known variants — explicit union, not Optional chains.
+
+- Do not add Optional only to distinguish "not sent" vs "sent empty" if logic treats them the same after decode — normalize once, reject empty by contract if required.
+
+### Where Optional is OK
+
+- Absence **changes behavior or contract** and a sum type would be heavier without benefit.
+- External API boundary where wire/schema is truly optional and documented.
+
+### Tests do not shape production API
+
+- Do not add Optional to domain/public signatures mainly for tests. Use explicit fixtures, test helpers, or a separate narrow function with a prod-valid meaning.
+- If two modes are both valid in production, Optional or a sum type is fine — comment the **prod meaning**, not "for tests".
+
+See also **pre-production-discipline** — "Tests do not dictate API".
+
+## Wire strings: non-empty after normalize
+
+If a wire/schema `string` field is **required** (not marked optional/nullable by contract), value after **strip/normalize** must not be empty — otherwise decode fails with explicit error.
+
+### Client/host → kernel/service
+
+Any string the client must send must exist as a field in the wire contract. Do not substitute internal non-empty constants in the callee when the field is missing from wire — add the field, validate at decode.
+
+### optional/nullable string
+
+- Field absent on wire — OK (`Optional` / absent in domain per contract).
+- Field present — normalize, then same non-empty rule as required strings; empty after normalize — decode error.
