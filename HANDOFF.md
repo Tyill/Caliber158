@@ -1,6 +1,8 @@
 # Handoff для следующего чата
 
-Обновлено: 2026-06-16 (holdout + Phase 1 quality runs)
+Обновлено: 2026-06-16 (v1 реализован; см. `.cursor/plans/architecture_v1_swiglu_*.plan.md` как source of truth для деталей)
+
+> **План v1:** детальная спецификация реализации — в `.cursor/plans/architecture_v1_swiglu_7baef79e.plan.md`. HANDOFF — статус и контекст, не дублировать расходящийся детальный план.
 
 ## Идея проекта
 
@@ -20,7 +22,7 @@
 - Зависимость **`max >=26.3.0,<27`** (GPU API, `std.gpu.host`)
 - Пакет в `src/chain/`
 - CLI: `main.mojo` → `info | smoke | train | test-grad | test-grad-gpu`
-- **Makefile** в корне — основной интерфейс команд (`make help`); gate перед commit: **`make test`**
+- **Makefile** в корне — `make test-grad-v1`, `make test-grad-gpu-v1`, gate: **`make test`**
 - Правило для агентов: `.cursor/rules/makefile-commands.mdc`
 
 ### Конфигурация через `.env`
@@ -83,6 +85,29 @@ quantize → forward (x_dev offset, alpha_dev) → backward → AdamW
 - **`make train-cuda`** на `L00_N0000.bin` (4096, RTX 3050 Ti): 10 epochs **~5 с** (было ~59 с в v1); MSE `44.6M → 9.9M` (≈ v1: `44.6M → 9.3M`)
 - Compile + run требуют видимый NVIDIA GPU (`sm_86` ок для 3050 Ti)
 
+### Архитектура v1 — dual SwiGLU + residual (2026-06-16) ✅
+
+Реализовано по плану `.cursor/plans/architecture_v1_swiglu_7baef79e.plan.md`:
+
+| Компонент | Статус |
+|-----------|--------|
+| `src/chain/arch.mojo` — `ArchKind`, `arch_from_env()`, param counts | ✅ |
+| CPU: `BatchMicroNet` v0/v1, block2 zero-init, `eval_mse`, AdamW block2 | ✅ |
+| `make test-grad-v1`, `make test-grad-gpu-v1` | ✅ |
+| GPU: `vector_add_kernel`, forward v1 (h0/hidden2/h1), quantize ×5 | ✅ |
+| GPU backward: head→`dL_dh`, block2 input-grad, skip, block1 | ✅ |
+| `GpuTrainState` block2 buffers (~+130 MB @ B=64, H=512), AdamW gate2/up2 | ✅ |
+| `download_shadow` gate2/up2 для holdout | ✅ |
+| `CALIBER158_ARCH`, `.env.example`, `docs/architecture.md` | ✅ |
+| `scripts/load-env.sh` — shell env не перезаписывается `.env` | ✅ |
+| Holdout прогон #6 (30 ep, H=512) | ✅ см. `lerning_compare.md` |
+
+**Результат holdout #6:** `rel_holdout ≈ 1.03` — **≈ v0** (1.04); Phase 1 не достигнута.
+
+CLI: `info | smoke | train | test-grad | test-grad-gpu` — v1 при `CALIBER158_ARCH=v1`.
+
+---
+
 ### Holdout + тюнинг качества (2026-06-16)
 
 - **Holdout split** в train: `CALIBER158_HOLDOUT_FRACTION=0.1`, seed=`CALIBER158_SEED=42` → 3687 train / 409 holdout
@@ -96,11 +121,12 @@ quantize → forward (x_dev offset, alpha_dev) → backward → AdamW
 | GPU v1 | 128 | 10 | 9.3×10⁶ | — | — | ~59 с |
 | Тюнинг | 256 | 50 | 0.0329 | — | ~0.99* | ~17 с |
 | Тюнинг | 512 | 100 | 0.0325 | — | ~0.98* | ~50 с |
-| **Holdout** | **512** | **30** | **0.0321** | **0.0384** | **1.04** | **~45 с** |
+| **Holdout v0** | **512** | **30** | **0.0321** | **0.0384** | **1.04** | **~45 с** |
+| **Holdout v1** | **512** | **30** | **0.0321** | **0.0382** | **1.03** | **~63 с** |
 
 \* train-only, до holdout
 
-**Вывод Phase 1:** train ≈ holdout ≈ `Var(Y)` → **underfit** (предсказание среднего), не overfit. Цель `rel < 0.001` — в ~1000× дальше. Следующий шаг — **архитектура v1**, не гиперпараметры.
+**Вывод Phase 1:** train ≈ holdout ≈ `Var(Y)` → **underfit**. v0, FP32 v0 (#5b) и v1 (#6) — все `rel ≈ 1.0`. Цель `rel < 0.001` — в ~1000× дальше. **Следующий шаг:** v1b (linear skip), 50 ep v1, H↑, FP32 v1 diagnostic — не гиперпараметры v0.
 
 ### Уже прогнано пользователем
 
@@ -121,17 +147,46 @@ quantize → forward (x_dev offset, alpha_dev) → backward → AdamW
 
 Критерий успеха: holdout MSE < 1e-4 (или `rel_holdout < 0.001`).
 
-GPU v2 и holdout закрыты; **следующий приоритет — архитектура v1** (второй SwiGLU-блок + residual) или FP32 diagnostic run.
+GPU v2, holdout и **v1 (CPU+GPU) закрыты**. Качество Phase 1 **не достигнуто**: holdout #6 `rel≈1.03` ≈ v0. Детали — `lerning_compare.md`.
+
+---
+
+## Архитектура v1 — статус (реализовано 2026-06-16)
+
+Спецификация: `docs/architecture.md`. Детальный план (historical): `.cursor/plans/architecture_v1_swiglu_7baef79e.plan.md`.
+
+**Сделано:** CPU + GPU v1, tests, holdout #6, docs — см. секцию «Архитектура v1» выше.
+
+**Не сделано / вне scope:**
+
+| Задача | Примечание |
+|--------|------------|
+| Phase 1 quality (`rel < 0.001`) | v1 @ 30 ep ≈ v0 (#6) |
+| Holdout 50 ep v1 | план §6 — не прогонялось |
+| FP32 v1 diagnostic | `QUANTIZE=0` + `ARCH=v1` |
+| v1b linear skip от `x` | если v1a не дотянет |
+| Checkpoint export (+ поле `arch`) | после quality ok |
+| Phase 2 batch extract | отдельно |
+| README sync | устарел |
+
+**Команды v1:**
+
+```bash
+make test-grad-v1 test-grad-gpu-v1
+CALIBER158_ARCH=v1 CALIBER158_HIDDEN_DIM=512 CALIBER158_EPOCHS=30 \
+  CALIBER158_LR=0.003 CALIBER158_WEIGHT_DECAY=0.001 make train-cuda
+```
 
 ---
 
 ## Что делать дальше (приоритет)
 
-### 1. Архитектура v1 / диагностика — **следующий шаг**
+### 1. Качество Phase 1 — **следующий эксперимент**
 
-- Holdout показал underfit (`rel_holdout ≈ 1.0` при H=512) — см. `lerning_compare.md`
-- v1: второй SwiGLU-блок + residual (`docs/architecture.md`)
-- Опц.: один прогон FP32 shadow без ternary — хватает ли ёмкости без квантизации
+- **50 ep v1** (те же env, что #6)
+- **v1b:** linear skip `β·(w_res·x)` + residual на h0
+- **FP32 v1 diagnostic** — отделить ёмкость от ternary
+- **H↑** (768+) при OOM → `BATCH_SIZE=32`
 
 ### 2. Checkpoint export (нет в коде)
 
@@ -188,8 +243,10 @@ make smoke             # synthetic student
 make smoke-cuda        # synthetic на CUDA path
 make train-cuda        # student на CALIBER158_DATASET
 make test              # gate перед commit
-make test-grad         # CPU сверка градиентов
-make test-grad-gpu     # CPU vs GPU backward (нужен CUDA runtime)
+make test-grad         # CPU v0 grad regression
+make test-grad-v1      # CPU v1 grad regression
+make test-grad-gpu     # CPU vs GPU backward v0
+make test-grad-gpu-v1  # CPU vs GPU backward v1
 ```
 
 Эквивалент через pixi: `pixi run <task>` (см. `pixi.toml`).
@@ -224,7 +281,9 @@ make test-grad-gpu     # CPU vs GPU backward (нужен CUDA runtime)
 | Нет per-batch upload весов/`X` | ✅ один upload at start |
 | Checkpoint export | ❌ |
 | Holdout + relative MSE | ✅ `CALIBER158_HOLDOUT_FRACTION`, `lerning_compare.md` |
-| Phase 1 quality (`rel_holdout < 0.001`) | ❌ сейчас ~1.04 |
+| Phase 1 quality (`rel_holdout < 0.001`) | ❌ v0 ~1.04, v1 ~1.03 (#6) |
+| Архитектура v1 (CPU + GPU) | ✅ `CALIBER158_ARCH=v1` |
+| `make test-grad-v1` / `test-grad-gpu-v1` | ✅ |
 | Teacher `make extract` без регрессии | ✅ (код не менялся) |
 
 ---
@@ -238,6 +297,7 @@ Caliber158/
 ├── main.mojo
 ├── pixi.toml             # mojo + max
 ├── src/chain/
+│   ├── arch.mojo
 │   ├── buffer.mojo
 │   ├── micro_net_batch.mojo
 │   ├── train.mojo, adamw.mojo, dataset.mojo, env.mojo, device.mojo

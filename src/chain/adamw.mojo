@@ -2,6 +2,7 @@
 
 from std.math import sqrt
 
+from .arch import ArchKind
 from .grads import ModelGrads
 from .micro_net_batch import BatchMicroNet
 
@@ -21,6 +22,10 @@ struct AdamWState(Copyable, Movable):
     var gate_v: List[Float32]
     var up_m: List[Float32]
     var up_v: List[Float32]
+    var gate2_m: List[Float32]
+    var gate2_v: List[Float32]
+    var up2_m: List[Float32]
+    var up2_v: List[Float32]
     var head_m: List[Float32]
     var head_v: List[Float32]
     var alpha_m: Float32
@@ -29,24 +34,32 @@ struct AdamWState(Copyable, Movable):
 
     @staticmethod
     def from_model(model: BatchMicroNet) -> AdamWState:
-        var gate_m = List[Float32](capacity=len(model.gate_shadow))
-        var gate_v = List[Float32](capacity=len(model.gate_shadow))
-        var up_m = List[Float32](capacity=len(model.up_shadow))
-        var up_v = List[Float32](capacity=len(model.up_shadow))
-        var head_m = List[Float32](capacity=len(model.head_shadow))
-        var head_v = List[Float32](capacity=len(model.head_shadow))
+        var gate_m = _zeros(len(model.gate_shadow))
+        var gate_v = _zeros(len(model.gate_shadow))
+        var up_m = _zeros(len(model.up_shadow))
+        var up_v = _zeros(len(model.up_shadow))
+        var gate2_m = _zeros(len(model.gate2_shadow))
+        var gate2_v = _zeros(len(model.gate2_shadow))
+        var up2_m = _zeros(len(model.up2_shadow))
+        var up2_v = _zeros(len(model.up2_shadow))
+        var head_m = _zeros(len(model.head_shadow))
+        var head_v = _zeros(len(model.head_shadow))
 
-        for _ in range(len(model.gate_shadow)):
-            gate_m.append(0.0)
-            gate_v.append(0.0)
-        for _ in range(len(model.up_shadow)):
-            up_m.append(0.0)
-            up_v.append(0.0)
-        for _ in range(len(model.head_shadow)):
-            head_m.append(0.0)
-            head_v.append(0.0)
-
-        return AdamWState(gate_m^, gate_v^, up_m^, up_v^, head_m^, head_v^, 0.0, 0.0, 0)
+        return AdamWState(
+            gate_m^,
+            gate_v^,
+            up_m^,
+            up_v^,
+            gate2_m^,
+            gate2_v^,
+            up2_m^,
+            up2_v^,
+            head_m^,
+            head_v^,
+            0.0,
+            0.0,
+            0,
+        )
 
     def apply(
         mut self,
@@ -76,6 +89,25 @@ struct AdamWState(Copyable, Movable):
             bias_corr2,
             config,
         )
+        if model.arch.is_v1():
+            _adamw_update_list(
+                model.gate2_shadow,
+                grads.gate2,
+                self.gate2_m,
+                self.gate2_v,
+                bias_corr1,
+                bias_corr2,
+                config,
+            )
+            _adamw_update_list(
+                model.up2_shadow,
+                grads.up2,
+                self.up2_m,
+                self.up2_v,
+                bias_corr1,
+                bias_corr2,
+                config,
+            )
         _adamw_update_list(
             model.head_shadow,
             grads.head,
@@ -94,6 +126,13 @@ struct AdamWState(Copyable, Movable):
             bias_corr2,
             config,
         )
+
+
+def _zeros(n: Int) -> List[Float32]:
+    var out = List[Float32](capacity=n)
+    for _ in range(n):
+        out.append(0.0)
+    return out^
 
 
 def one_minus_pow(base: Float32, exp: Int) -> Float32:

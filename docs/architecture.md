@@ -59,7 +59,35 @@ offset  size        field
 - Holdout MSE < 1e-4 on 10k samples, or
 - Relative error < 0.1% of `Var(Y_qwen)`.
 
-## Future (v1)
+## Future (v1b+)
 
-- Second SwiGLU block with residual if v0 MSE is insufficient.
 - Parallel worker pool: one job per chain (116 736 for 0.5B).
+
+---
+
+## Student network (v1)
+
+Second SwiGLU block (H→H) with residual on `h0`; head reads `h1 = h0 + SwiGLU2(h0)`.
+
+```
+x [D=896]
+  ├─ TernaryLinear(D → H)  →  gate1
+  └─ TernaryLinear(D → H)  →  up1
+  h0 = SiLU(gate1) ⊙ up1
+  ├─ TernaryLinear(H → H)  →  gate2
+  └─ TernaryLinear(H → H)  →  up2
+  h2 = SiLU(gate2) ⊙ up2
+  h1 = h0 + h2
+  TernaryLinear(H → 1)      →  y_tern
+  out = α · y_tern
+```
+
+| vs v0 | v1 |
+|-------|-----|
+| 1× SwiGLU(D→H) | 2× SwiGLU: (D→H) + (H→H) |
+| `h → head` | `h0 + SwiGLU2(h0) → head` |
+| params @ H=512 | ~918k → ~1.44M (+2·H²) |
+
+Select with `CALIBER158_ARCH=v1` (default `v0`). Block2 shadow weights are zero-init so training starts near v0 (`h1 ≈ h0`).
+
+Same loss (MSE), STE, AdamW, and single α as v0. Linear skip from `x` is v1b only.

@@ -139,3 +139,28 @@ def scale_kernel(
     if i >= n:
         return
     values[i] = values[i] * scale[0]
+
+
+def vector_add_kernel(
+    a: UnsafePointer[Float32, MutAnyOrigin],
+    b: UnsafePointer[Float32, MutAnyOrigin],
+    result: UnsafePointer[Float32, MutAnyOrigin],
+    n: Int,
+):
+    """result[i] = a[i] + b[i]."""
+    var i = Int(block_idx.x * block_dim.x + thread_idx.x)
+    if i >= n:
+        return
+    result[i] = a[i] + b[i]
+
+
+def vector_add_inplace_kernel(
+    a: UnsafePointer[Float32, MutAnyOrigin],
+    b: UnsafePointer[Float32, MutAnyOrigin],
+    n: Int,
+):
+    """a[i] += b[i]."""
+    var i = Int(block_idx.x * block_dim.x + thread_idx.x)
+    if i >= n:
+        return
+    a[i] += b[i]

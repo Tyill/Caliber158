@@ -1,5 +1,6 @@
 """Training loop: batched MSE + STE backward + AdamW."""
 
+from .arch import ArchKind, arch_label
 from .adamw import AdamWConfig, AdamWState
 from .buffer import ChainData
 from .device import DeviceKind, cuda_available
@@ -135,6 +136,8 @@ def train_chain(
         " backend=mojo",
         " quantize=",
         "ternary" if model.use_ternary else "fp32",
+        " arch=",
+        arch_label(model.arch),
     )
     if holdout.holdout.n_samples > 0:
         print(
@@ -148,10 +151,10 @@ def train_chain(
         _train_epochs_gpu(model, train_data, holdout, config)
     else:
         var optimizer = AdamWState.from_model(model)
-        var grads = ModelGrads.zeros(
-            len(model.gate_shadow),
-            len(model.up_shadow),
-            len(model.head_shadow),
+        var grads = ModelGrads.zeros_for_model(
+            model.input_dim,
+            model.hidden_dim,
+            model.arch,
         )
         _train_epochs_cpu(model, optimizer, grads, train_data, holdout, config)
 
@@ -177,3 +180,7 @@ def init_random_weights(mut model: BatchMicroNet, scale: Float32 = 0.1) -> None:
     for i in range(len(model.head_shadow)):
         seed = lcg_next(seed)
         model.head_shadow[i] = (unit_float(seed) * 2.0 - 1.0) * scale
+    # Zero-init block2 so v1 starts near v0 (h1 ≈ h0).
+    for i in range(len(model.gate2_shadow)):
+        model.gate2_shadow[i] = 0.0
+        model.up2_shadow[i] = 0.0

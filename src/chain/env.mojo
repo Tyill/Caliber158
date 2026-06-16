@@ -2,6 +2,7 @@
 
 from std.os import getenv
 
+from .arch import ArchKind, arch_from_env
 from .device import DeviceKind, resolve_device_from_env, train_backend_from_env
 
 
@@ -29,6 +30,7 @@ struct TrainEnv(Copyable, Movable):
     var holdout_fraction: Float32
     var split_seed: UInt64
     var use_ternary: Bool
+    var arch: ArchKind
 
     @staticmethod
     def load() raises -> TrainEnv:
@@ -55,6 +57,7 @@ struct TrainEnv(Copyable, Movable):
             holdout_fraction=_env_float("CALIBER158_HOLDOUT_FRACTION", 0.1),
             split_seed=UInt64(_env_int("CALIBER158_SEED", 42)),
             use_ternary=_env_use_ternary(),
+            arch=arch_from_env(),
         )
 
 

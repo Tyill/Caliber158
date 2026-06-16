@@ -2,12 +2,18 @@
 
 from std.sys import argv
 
+from src.chain.test_batch_grad import (
+    run_batch_grad_regression_test,
+    run_batch_grad_v1_regression_test,
+    run_gpu_backward_regression_test,
+    run_gpu_backward_v1_regression_test,
+)
 from src.chain import BatchMicroNet, TrainConfig, init_random_weights, train_chain
+from src.chain.arch import arch_label
 from src.chain.buffer import ChainData
 from src.chain.holdout import no_holdout, split_holdout
 from src.chain.dataset import ChainDataset
 from src.chain.env import TrainEnv
-from src.chain.test_batch_grad import run_batch_grad_regression_test, run_gpu_backward_regression_test
 
 
 def print_info(env: TrainEnv) -> None:
@@ -19,6 +25,7 @@ def print_info(env: TrainEnv) -> None:
     print("  device    :", env.device.label())
     print("  backend   :", env.train_backend)
     print("  quantize  :", "ternary" if env.use_ternary else "fp32 (CALIBER158_QUANTIZE=0)")
+    print("  arch      :", arch_label(env.arch))
     print()
     print("Config: copy .env.example → .env, or export CALIBER158_* vars.")
     print("Usage:")
@@ -55,7 +62,9 @@ def run_train(dataset_path: String, hidden_dim: Int, env: TrainEnv) raises -> No
             env.hidden_size,
         )
 
-    var model = BatchMicroNet(dataset.input_dim, hidden_dim, use_ternary=env.use_ternary)
+    var model = BatchMicroNet(
+        dataset.input_dim, hidden_dim, use_ternary=env.use_ternary, arch=env.arch
+    )
     init_random_weights(model, env.init_scale)
 
     var split = split_holdout(data, env.holdout_fraction, env.split_seed)
@@ -98,12 +107,18 @@ def main() raises:
         return
 
     if command == "test-grad":
-        run_batch_grad_regression_test()
+        if env.arch.is_v1():
+            run_batch_grad_v1_regression_test()
+        else:
+            run_batch_grad_regression_test()
         print("test-grad: ok")
         return
 
     if command == "test-grad-gpu":
-        run_gpu_backward_regression_test()
+        if env.arch.is_v1():
+            run_gpu_backward_v1_regression_test()
+        else:
+            run_gpu_backward_regression_test()
         print("test-grad-gpu: ok")
         return
 
@@ -113,7 +128,9 @@ def main() raises:
             hidden_dim = Int(args[2])
         var dataset = ChainDataset.synthetic(env.smoke_samples, env.hidden_size)
         var data = ChainData.from_dataset(dataset)
-        var model = BatchMicroNet(env.hidden_size, hidden_dim, use_ternary=env.use_ternary)
+        var model = BatchMicroNet(
+            env.hidden_size, hidden_dim, use_ternary=env.use_ternary, arch=env.arch
+        )
         init_random_weights(model, env.init_scale)
         train_chain(
             model,

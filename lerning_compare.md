@@ -4,7 +4,7 @@
 
 **Датасет:** `data/chains/L00_N0000.bin`  
 **Teacher:** Qwen2.5-0.5B, layer=0, neuron=0, **4096 samples** (не 100k из `.env`)  
-**Student:** Mojo v0, ternary `{-1,0,1}` + α, GPU forward + host backward/AdamW  
+**Student:** Mojo v0/v1 (`CALIBER158_ARCH`), ternary `{-1,0,1}` + α, **полный GPU train** (forward + backward + AdamW on device)  
 **GPU:** NVIDIA RTX 3050 Ti  
 
 ## Масштаб teacher (Y)
@@ -172,6 +172,36 @@
 
 ---
 
+### 6. GPU, H=512, 30 epochs + holdout — v1 ternary ✅
+
+| Параметр | Значение |
+|----------|----------|
+| `CALIBER158_ARCH` | **v1** (dual SwiGLU + residual) |
+| `HIDDEN_DIM` | 512 |
+| `EPOCHS` | 30 |
+| `LR` | 0.003 |
+| `WEIGHT_DECAY` | 0.001 |
+| `HOLDOUT_FRACTION` | 0.1 (`SEED=42`) |
+| Params | **1 442 305** (+524k block2) |
+| Split | **3687 train / 409 holdout** |
+
+| Epoch | train_mse | holdout_mse | rel_holdout |
+|-------|-----------|-------------|-------------|
+| 0 | 1.94×10⁸ | 1.41×10⁸ | 3.81×10⁹ |
+| 23 | 0.765 | 0.353 | 9.51 |
+| 27 | 0.0346 | 0.0404 | 1.09 |
+| 29 | **0.0321** | **0.0382** | **1.03** |
+
+| | |
+|--|--|
+| Wall time | ~63 с |
+| Финал holdout `rel` | **1.03** |
+| vs v0 ternary #5 | **≈ то же плато** (1.04 vs 1.03) |
+
+**Вывод:** v1 @ 30 ep не улучшил holdout vs v0 — block2 zero-init + те же гиперпараметры; нужны 50 ep, v1b (linear skip), или H↑.
+
+---
+
 ## Сводная таблица (финальные метрики)
 
 | Прогон | H | Epochs | Train MSE | Holdout MSE | rel_holdout | Время |
@@ -182,6 +212,7 @@
 | GPU | 512 | 100 | 0.0325 | — | ~0.98* | ~50 с |
 | **GPU + holdout** | **512** | **30** | **0.0321** | **0.0384** | **1.04** | **~45 с** |
 | **FP32 v0 + holdout** | **512** | **30** | **0.0327** | **0.0372** | **1.004** | **~36 с** |
+| **v1 ternary + holdout** | **512** | **30** | **0.0321** | **0.0382** | **1.03** | **~63 с** |
 
 \* train MSE / Var(Y), holdout не измерялся
 
@@ -193,7 +224,8 @@
 2. **Рост `HIDDEN_DIM`** 128 → 256 дал огромный скачок; 256 → 512 почти не помог.
 3. **Holdout ≈ train** на плато (`rel ~ 1.0`) → **underfit**, не overfit. Модель не выучивает teacher, а предсказывает ~среднее `Y`.
 4. **FP32 diagnostic (#5b):** `rel_holdout ≈ 1.004` — как ternary → узкое место **ёмкость v0**, не ternary.
-5. **Дальше:** архитектура v1 (второй SwiGLU-блок + residual); не гиперпараметры.
+5. **v1 ternary (#6):** `rel_holdout ≈ 1.03` @ 1.44M params — **≈ v0**; block2 не помог за 30 ep.
+6. **Дальше:** 50 ep v1, v1b (linear skip от x), H↑, или FP32 v1 diagnostic.
 
 ---
 
@@ -206,4 +238,9 @@ make train-cuda
 
 # FP32 diagnostic (v0, no ternary quantize):
 CALIBER158_QUANTIZE=0 make train-cuda
+
+# v1 ternary (shell env overrides .env):
+CALIBER158_ARCH=v1 CALIBER158_HIDDEN_DIM=512 CALIBER158_LR=0.003 \
+  CALIBER158_WEIGHT_DECAY=0.001 CALIBER158_EPOCHS=30 make train-cuda
+make test-grad-v1 test-grad-gpu-v1
 ```

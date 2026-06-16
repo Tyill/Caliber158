@@ -72,6 +72,16 @@ def enqueue_adamw_apply(
     grad_up: DeviceBuffer[DType.float32],
     grad_head: DeviceBuffer[DType.float32],
     grad_alpha: DeviceBuffer[DType.float32],
+    mut gate2_shadow: DeviceBuffer[DType.float32],
+    mut up2_shadow: DeviceBuffer[DType.float32],
+    grad_gate2: DeviceBuffer[DType.float32],
+    grad_up2: DeviceBuffer[DType.float32],
+    mut gate2_m: DeviceBuffer[DType.float32],
+    mut gate2_v: DeviceBuffer[DType.float32],
+    mut up2_m: DeviceBuffer[DType.float32],
+    mut up2_v: DeviceBuffer[DType.float32],
+    apply_block2: Bool,
+    block2_size: Int,
     mut gate_m: DeviceBuffer[DType.float32],
     mut gate_v: DeviceBuffer[DType.float32],
     mut up_m: DeviceBuffer[DType.float32],
@@ -88,6 +98,7 @@ def enqueue_adamw_apply(
 ) raises -> None:
     var blocks_gate = _ceildiv(gate_size, 256)
     var blocks_head = _ceildiv(head_size, 256)
+    var blocks_b2 = _ceildiv(block2_size, 256)
 
     var lr = config.learning_rate
     var b1 = config.beta1
@@ -127,6 +138,39 @@ def enqueue_adamw_apply(
         grid_dim=blocks_gate,
         block_dim=256,
     )
+    if apply_block2:
+        ctx.enqueue_function[adamw_update_kernel, adamw_update_kernel](
+            gate2_shadow.unsafe_ptr(),
+            grad_gate2.unsafe_ptr(),
+            gate2_m.unsafe_ptr(),
+            gate2_v.unsafe_ptr(),
+            block2_size,
+            bias_corr1,
+            bias_corr2,
+            lr,
+            b1,
+            b2,
+            eps,
+            wd,
+            grid_dim=blocks_b2,
+            block_dim=256,
+        )
+        ctx.enqueue_function[adamw_update_kernel, adamw_update_kernel](
+            up2_shadow.unsafe_ptr(),
+            grad_up2.unsafe_ptr(),
+            up2_m.unsafe_ptr(),
+            up2_v.unsafe_ptr(),
+            block2_size,
+            bias_corr1,
+            bias_corr2,
+            lr,
+            b1,
+            b2,
+            eps,
+            wd,
+            grid_dim=blocks_b2,
+            block_dim=256,
+        )
     ctx.enqueue_function[adamw_update_kernel, adamw_update_kernel](
         head_shadow.unsafe_ptr(),
         grad_head.unsafe_ptr(),

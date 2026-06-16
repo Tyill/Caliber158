@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
 # Export variables from project .env for pixi run / pixi shell.
+# Does not override variables already set in the parent environment.
 root="${PIXI_PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 env_file="${root}/.env"
 
 if [[ -f "${env_file}" ]]; then
-  set -a
-  # shellcheck source=/dev/null
-  source "${env_file}"
-  set +a
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ -z "${line}" ]] && continue
+    key="${line%%=*}"
+    val="${line#*=}"
+    key="${key%"${key##*[![:space:]]}"}"
+    val="${val#"${val%%[![:space:]]*}"}"
+    if [[ -z "${!key+x}" ]]; then
+      export "${key}=${val}"
+    fi
+  done < "${env_file}"
 fi
 
 # Prefer project venv over system Python when present.
