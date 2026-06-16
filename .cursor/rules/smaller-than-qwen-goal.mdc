@@ -1,0 +1,38 @@
+---
+description: Product goal — deployed student must be smaller than Qwen (disk + RAM)
+alwaysApply: true
+---
+
+# Smaller Than Qwen (product goal)
+
+The **deployed** Caliber158 student must use **less storage and less inference RAM** than
+the teacher (Qwen2.5-0.5B baseline: ~0.5B params, ~1 GB bf16 checkpoint).
+
+Details: [docs/product-goals.md](docs/product-goals.md).
+
+## Hard constraint
+
+- Evaluate **total** size: `num_chains × params_per_chain` (116 736 chains for 0.5B),
+  not per-chain params alone.
+- Do not recommend or implement architectures that **replicate** full micro-nets per chain
+  when total params exceed Qwen unless the user explicitly overrides the size goal.
+- Any arch / H / experiment proposal must state **total params and approximate MB** vs Qwen.
+
+## Known sizing (116 736 chains)
+
+| Form | params/chain | total | vs Qwen |
+|------|--------------|-------|---------|
+| `exact` | ~1.8k | ~209M | smaller |
+| v0 H=16 | ~29k | ~3.35B | ~6× larger |
+| v0 H=128 | ~230k | ~27B | much larger |
+
+Ternary bit-packing alone does not fix multi-billion param counts.
+
+## When designing or experimenting
+
+- Prefer forms that keep **total** student weight below Qwen (e.g. teacher-shaped /
+  shared weights, minimal params per chain).
+- Per-chain training quality (Phase 1) is necessary but **not sufficient** if the assembled
+  model is larger than Qwen.
+- Do not use “FP32 trains on v0 H” as the main argument for production arch if total size
+  violates this goal.

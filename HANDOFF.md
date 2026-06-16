@@ -1,6 +1,6 @@
 # Handoff для следующего чата
 
-Обновлено: 2026-06-17 (100k; FP32 v0 + rel_decay → Phase 1 ✅; ternary ❌)
+Обновлено: 2026-06-17 (production target: **`arch=exact`**; FP32 diagnostic ✅; warm-start ❌)
 
 > **План v1:** детальная спецификация реализации — в `.cursor/plans/architecture_v1_swiglu_7baef79e.plan.md`. HANDOFF — статус и контекст, не дублировать расходящийся детальный план.
 
@@ -10,7 +10,25 @@
 
 Первый target: **Qwen2.5-0.5B** (`hidden=896`, `intermediate=4864`, `24` слоя → **116 736** MLP-цепочек).
 
-Подробнее: `docs/target.md`, `docs/architecture.md`, `docs/qwen2.5-0.5b.md`.
+Подробнее: `docs/target.md`, `docs/architecture.md`, `docs/product-goals.md`, `docs/qwen2.5-0.5b.md`.
+
+### Production target: `exact`
+
+**Решение (2026-06-17):** целевая production-форма — **`CALIBER158_ARCH=exact`**, не v0/v1 с bottleneck `H`.
+
+| | `exact` | v0 H=16 (legacy) |
+|--|---------|------------------|
+| Форма | teacher-shaped: `α·SiLU(w_g·x)·(w_u·x)` | bottleneck `D→H→1` |
+| Params / chain | **1 793** | 28 689 |
+| Total @ 116k chains | **~209M** (~0.2–0.8 GB) | **~3.35B** (~3 GB) |
+| vs Qwen 0.5B | **меньше** | **больше** |
+
+- **Torch:** `exact` ✅ (`python/student/model.py`)
+- **Mojo:** `exact` ❌ — **следующий порт**; сейчас stack v0/v1
+- **Phase 1 ternary @ 100k:** `rel≈1` и для v0, и для exact — **STE блокер**, не выбор arch
+- **FP32 @ 100k:** capacity доказана (#100k-h) — **диагностика**, не аргумент за v0 vs exact
+
+Спека: `docs/architecture.md` § «Production target: exact».
 
 ---
 
@@ -177,17 +195,18 @@ CLI: `info | smoke | train | test-grad | test-grad-gpu` — v1 при `CALIBER15
 
 ## Текущая фаза
 
-**Phase 1**: одна цепочка `L00_N0000`.
+**Phase 1**: одна цепочка `L00_N0000`, **production arch = `exact`**.
 
 Критерий успеха: holdout MSE < 1e-4 (или `rel_holdout < 0.001`).
 
-| Path | Статус @ 100k |
-|------|---------------|
-| **FP32 v0 H=128 + rel_decay** (Torch) | ✅ **`rel=0.00073`** (#100k-h) |
-| **Ternary v0** (production, Mojo) | ❌ **`rel≈1`** (#100k-c/j) |
-| **arch exact** (Torch R&D) | ❌ FP32 rel≈0.23, ternary ≈0.95 — хуже v0 |
+| Path | Статус @ 100k | Роль |
+|------|---------------|------|
+| **FP32** (Torch `QUANTIZE=0`, diagnostic) | ✅ `rel=0.00073` (#100k-h) — capacity OK | **не гоняем** как primary R&D |
+| **Ternary `exact`** (production target) | ❌ `rel≈1` (#100k-k/z) | **Phase 1 blocker** — STE |
+| **Ternary v0/v1** (legacy Mojo stack) | ❌ `rel≈1` | infra / parity; **не production arch** |
+| **Mojo `exact`** | ❌ не портирован | **следующий код** |
 
-Детали — `lerning_compare.md` § «100k re-extract», § «rel_decay».
+Детали — `lerning_compare.md` § «100k re-extract», § «rel_decay», § «exact vs v0».
 
 ---
 
@@ -201,12 +220,14 @@ CLI: `info | smoke | train | test-grad | test-grad-gpu` — v1 при `CALIBER15
 
 | Задача | Примечание |
 |--------|------------|
-| Phase 1 quality ternary (`rel < 0.001`) | ❌ 4k/100k ternary ≈1 |
-| Phase 1 quality FP32 @ 100k | ✅ **rel=0.00073** (#100k-h, rel_decay) |
-| ~~Re-extract 100k~~ | ✅ `CALIBER158_SAMPLES=100000 make extract` |
-| **Ternary @ 100k** (warm-start, grad clip, Mojo) | **следующий шаг** |
-| **Порт rel_decay** в Mojo train | после ternary warm-start |
-| Arch `exact` (Torch code есть) | ❌ negative — хуже v0 |
+| Phase 1 ternary **`exact`** @ 100k (`rel < 0.001`) | ❌ `rel≈1` — **приоритет** (STE) |
+| ~~Phase 1 FP32~~ | ✅ доказано (#100k-h); diagnostic only |
+| ~~Warm-start FP32→ternary~~ | ❌ negative; **удалено из кода** |
+| ~~Re-extract 100k~~ | ✅ |
+| **Порт `exact` в Mojo** (CPU + GPU, tests) | **следующий код** |
+| **Ternary STE @ 100k на `exact`** (Torch → Mojo) | **следующий R&D** |
+| **Порт rel_decay** в Mojo train | после ternary breakthrough |
+| v0/v1 Mojo stack | ✅ legacy; не production target |
 | Checkpoint export (+ поле `arch`) | после quality ok |
 | Phase 2 batch extract | отдельно |
 | README sync | устарел |
@@ -224,18 +245,26 @@ CALIBER158_ARCH=v1 CALIBER158_HIDDEN_DIM=512 CALIBER158_EPOCHS=30 \
 
 ## Что делать дальше (приоритет)
 
-### 1. Phase 1 — **ternary production path** (приоритет)
+### 1. Phase 1 — **ternary `exact`** (production path)
 
-**Факт:** FP32 v0 H=128 + rel_decay @ 100k → **`rel=0.00073`** (#100k-h); ternary → `rel≈1`.
+**Факт:** FP32 доказал capacity @ 100k. Ternary v0 и ternary `exact` → `rel≈1` — **STE блокер**, не H и не exact vs v0. Warm-start не помог.
 
 | Шаг | Действие |
 |-----|----------|
-| **A** | Warm-start: FP32 v0 train → quantize weights → ternary fine-tune |
-| **B** | Grad clip для ternary @ 100k |
-| **C** | Порт **rel_decay** в Mojo (`CALIBER158_LR_SCHEDULE=rel_decay`) |
-| **D** | Mojo `train-cuda` на **100k** `.bin`, LR=3e-4 (ternary baseline) |
+| **A** | STE / init / quant гипотезы на **`arch=exact` @ 100k** (Torch) |
+| **B** | Grad clip для ternary `exact` @ 100k |
+| **C** | **Порт `exact` в Mojo** — `BatchMicroNet`, GPU kernels, `make test-grad-exact` |
+| **D** | Порт **rel_decay** в Mojo (`CALIBER158_LR_SCHEDULE=rel_decay`) |
+| **E** | Mojo `train-cuda` на **100k** `.bin` с **`CALIBER158_ARCH=exact`** |
 
-**Не приоритет:** arch `exact` (FP32 rel≈0.23); v1b / block2 lcg — negative; FP32 H=256 (#100k-g) — marginal vs rel_decay.
+**Не гоняем:** FP32 sweeps как primary R&D; warm-start; v0/v1 как production target.
+
+**Baseline Torch:**
+
+```bash
+CALIBER158_ARCH=exact CALIBER158_EPOCHS=20 CALIBER158_LR=0.0003 \
+  CALIBER158_WEIGHT_DECAY=0.001 make train-torch
+```
 
 ### 2. Checkpoint export (нет в коде)
 
@@ -260,21 +289,18 @@ CALIBER158_ARCH=v1 CALIBER158_HIDDEN_DIM=512 CALIBER158_EPOCHS=30 \
 
 ## PyTorch student prototype (parallel, не замена Mojo)
 
-**Статус: Phase 1 R&D** (100k ✅; **FP32 Phase 1 ✅** via rel_decay; ternary блокер идентифицирован).
+**Статус: ternary-only R&D на production arch `exact`** (FP32 diagnostic ✅; warm-start ❌).
 
-**Зачем Torch:** нашли **рабочий recipe** для 100k: `H=128, LR=3e-4→1e-4 (rel_decay), WD=1e-3, 20 ep`; FP32 vs ternary A/B.
+**Зачем Torch:** быстрые эксперименты **ternary `exact`** @ 100k до порта в Mojo. Default arch для R&D: **`exact`**. `QUANTIZE=0` — rare FP32 control only.
 
 **Сделано:**
 
-- Одна chain: `L00_N0000.bin` **100k**, holdout @ seed 42 (**90k / 10k**)
-- Прогоны **#T1–#T15**, **#100k-c…#100k-l**, диагностика — `lerning_compare.md`
-- Torch: `MicroNet` v0/v1/v1b/**exact**; **rel_decay** LR schedule
+- 100k dataset, holdout, `rel_decay`, grad_clip env
+- FP32 diagnostic (#100k-h, #100k-n) — **закрыто**, код Torch без FP32 path
+- Warm-start — **удалён** (не помог)
+- Прогоны #T*, #100k-* — `lerning_compare.md`
 
-**Следующий эксперимент:**
-
-- Ternary warm-start (FP32 → quantize → fine-tune)
-- Порт rel_decay в Mojo
-- Mojo train на 100k `.bin`
+**Следующий эксперимент:** ternary STE гипотезы @ **`arch=exact`**, 100k.
 
 ### Контракт паритета с Mojo (обязательно)
 
@@ -285,9 +311,8 @@ CALIBER158_ARCH=v1 CALIBER158_HIDDEN_DIM=512 CALIBER158_EPOCHS=30 \
 | Loss | MSE, mean over batch | `F.mse_loss(..., reduction='mean')` |
 | `Var(Y)` | population variance holdout | то же на holdout split |
 | Init weights | LCG seed `0xC158_C158`, scale `INIT_SCALE`, block2 **zero** | тот же алгоритм для сравнимого старта |
-| Ternary | STE: forward `sign/threshold`, backward через shadow | `torch.autograd.Function` или detach+round |
-| `QUANTIZE=0` | FP32 shadow, no STE | `use_ternary=False` — diagnostic |
-| Arch | `CALIBER158_ARCH=v0\|v1` (+ Torch R&D: `v1b`, `exact`) | Mojo: v0/v1 only |
+| Ternary | STE: forward `sign/threshold`, backward через shadow | `torch.autograd.Function` (always ternary) |
+| Arch | Mojo: `v0\|v1` (legacy stack) | Torch: **`exact`** (production target) + `v0/v1/v1b` (parity/legacy) |
 | Optimizer | AdamW, те же β, eps, weight_decay | `torch.optim.AdamW` |
 
 **Sanity после первого train:** на одном batch с фиксированным init — forward loss Torch vs Mojo CPU в пределах ~1e-4 (float reorder ok).
@@ -349,17 +374,19 @@ scripts/run-test-torch-parity.sh
 #### Этап 4 — 100k + FP32 + rel_decay ✅ (2026-06-17)
 
 - [x] Re-extract 100k (`make extract`)
-- [x] Torch `arch=exact` (код; ternary/FP32 — хуже v0)
+- [x] Torch `arch=exact` — **production target** (ternary `rel≈1` ≈ v0; wins on size)
 - [x] #100k-c…#100k-l (ternary, FP32, rel_decay, exact)
 - [x] **#100k-h FP32 v0 + rel_decay** — **Phase 1 ✅** `rel=0.00073`
 - [x] LR schedule `rel_decay` в Torch (`train_chain.py`, env)
 
-#### Этап 5 — Ternary production + Mojo (следующий)
+#### Этап 5 — Ternary `exact` + Mojo port (следующий)
 
-- [ ] Ternary warm-start: FP32 train → quantize → fine-tune
-- [ ] Grad clip @ 100k ternary
+- [ ] STE / init гипотезы ternary **`exact`** @ 100k
+- [ ] Grad clip @ 100k ternary `exact`
+- [ ] **Порт `exact` в Mojo** (CPU + GPU, tests)
 - [ ] Порт rel_decay в Mojo train
-- [ ] Mojo train на 100k `.bin`
+- [ ] Mojo train на 100k `.bin` с `CALIBER158_ARCH=exact`
+- [x] ~~Warm-start~~ — удалено (negative)
 
 #### Этап 6 — Optional hardening (частично)
 
@@ -372,18 +399,12 @@ scripts/run-test-torch-parity.sh
 
 ```bash
 # не в make test
-make train-torch          # CALIBER158_DATASET, env как train-cuda
-make smoke-torch          # synthetic, 3 ep
+make train-torch          # always ternary STE
+make smoke-torch
 
-# 100k Torch — Phase 1 winner (FP32 + rel_decay)
-CALIBER158_ARCH=v0 CALIBER158_QUANTIZE=0 CALIBER158_HIDDEN_DIM=128 \
-  CALIBER158_EPOCHS=20 CALIBER158_LR=0.0003 CALIBER158_LR_MIN=0.0001 \
-  CALIBER158_LR_REL_THRESHOLD=0.01 CALIBER158_LR_SCHEDULE=rel_decay \
+# 100k ternary baseline (production arch)
+CALIBER158_ARCH=exact CALIBER158_EPOCHS=20 CALIBER158_LR=0.0003 \
   CALIBER158_WEIGHT_DECAY=0.001 make train-torch
-
-# 100k ternary baseline (production path — platо ~1)
-CALIBER158_ARCH=v0 CALIBER158_HIDDEN_DIM=128 CALIBER158_EPOCHS=20 \
-  CALIBER158_LR=0.0003 CALIBER158_WEIGHT_DECAY=0.001 make train-torch
 ```
 
 `make test` — **только Mojo**, без изменений.
@@ -401,9 +422,10 @@ CALIBER158_ARCH=v0 CALIBER158_HIDDEN_DIM=128 CALIBER158_EPOCHS=20 \
 
 ### Порядок работ vs Mojo
 
-1. **Ternary warm-start** + grad clip — Torch, затем Mojo
-2. Порт **rel_decay** в Mojo train
-3. Mojo остаётся production path + `make test`
+1. **Ternary `exact`** эксперименты в Torch @ 100k
+2. **Порт `exact`** в Mojo (CPU + GPU)
+3. Порт **rel_decay** в Mojo train
+4. Mojo остаётся production runtime + `make test`
 
 ---
 
@@ -456,7 +478,7 @@ make smoke-torch       # Torch synthetic smoke
 
 ## Известные ограничения / техдолг
 
-- Phase 1: **STE ternary — блокер** @ 100k; FP32 v0 H=128 → `rel≈0.005` (`lerning_compare.md` §100k)
+- Phase 1: **STE ternary — блокер** @ 100k на **`exact`** (и v0); FP32 diagnostic `rel=0.00073` (#100k-h)
 - `L00_N0000.bin` — **100k** (342 MB); Mojo train на 100k **не прогонялся** с новыми LR
 - README не синхронизирован с кодом
 - `mojo build` требует **видимый NVIDIA GPU** при compile (CI workaround — v2.1)
@@ -483,13 +505,14 @@ make smoke-torch       # Torch synthetic smoke
 | Нет per-batch upload весов/`X` | ✅ один upload at start |
 | Checkpoint export | ❌ |
 | Holdout + relative MSE | ✅ `CALIBER158_HOLDOUT_FRACTION`, `lerning_compare.md` |
-| Phase 1 ternary (`rel_holdout < 0.001`) | ❌ 4k/100k ≈1 |
-| Phase 1 FP32 @ 100k (#100k-e) | ⚠️ **rel≈0.005** |
+| Phase 1 ternary **`exact`** (`rel < 0.001`) | ❌ 100k ≈1 — STE blocker |
+| Phase 1 FP32 @ 100k (#100k-h) | ✅ diagnostic `rel=0.00073` |
 | Re-extract 100k | ✅ |
 | Torch #100k sweep | ✅ `lerning_compare.md` |
-| Mojo train @ 100k + LR=3e-4 | ❌ следующий |
-| Arch `exact` (Torch) | ⚠️ код есть; ternary platо ~1 |
-| Архитектура v1 (CPU + GPU) | ✅ `CALIBER158_ARCH=v1` |
+| **`exact` в Mojo** | ❌ **следующий порт** |
+| Mojo train @ 100k `exact` | ❌ после порта |
+| Production target **`exact`** (docs) | ✅ `docs/architecture.md` |
+| Legacy v0/v1 (Mojo CPU + GPU) | ✅ `CALIBER158_ARCH=v0/v1` |
 | `make test-grad-v1` / `test-grad-gpu-v1` | ✅ |
 | Teacher `make extract` без регрессии | ✅ (код не менялся) |
 | Torch student prototype (v0/v1, parity) | ✅ `make test-torch-parity` |

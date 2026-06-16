@@ -121,6 +121,9 @@ class StudentEnv:
     lr_schedule: str
     lr_min: float
     lr_rel_threshold: float
+    lr_min2: float
+    lr_rel_threshold2: float
+    grad_clip_max_norm: float
 
     @property
     def quantize_label(self) -> str:
@@ -136,8 +139,7 @@ def load_student_env() -> StudentEnv:
     arch = _get("CALIBER158_ARCH", "v0").strip().lower()
     if arch not in {"v0", "v1", "v1b", "exact"}:
         arch = "v0"
-    quantize_raw = os.environ.get("CALIBER158_QUANTIZE", "1")
-    use_ternary = quantize_raw.strip() != "0"
+    use_ternary = os.environ.get("CALIBER158_QUANTIZE", "1").strip() != "0"
     block2_init = _get("CALIBER158_BLOCK2_INIT", "zero").strip().lower()
     if block2_init not in {"zero", "lcg"}:
         block2_init = "zero"
@@ -146,13 +148,14 @@ def load_student_env() -> StudentEnv:
         lr_schedule = "none"
     block2_scale_raw = os.environ.get("CALIBER158_BLOCK2_INIT_SCALE")
     block2_init_scale = float(block2_scale_raw) if block2_scale_raw is not None else None
+    learning_rate = _get_float("CALIBER158_LR", 0.001)
     return StudentEnv(
         hidden_dim=_get_int("CALIBER158_HIDDEN_DIM", 128),
         dataset_path=dataset,
         hidden_size=_get_int("CALIBER158_HIDDEN_SIZE", 896),
         epochs=_get_int("CALIBER158_EPOCHS", 10),
         batch_size=_get_int("CALIBER158_BATCH_SIZE", 64),
-        learning_rate=_get_float("CALIBER158_LR", 0.001),
+        learning_rate=learning_rate,
         weight_decay=_get_float("CALIBER158_WEIGHT_DECAY", 0.01),
         beta1=_get_float("CALIBER158_ADAM_BETA1", 0.9),
         beta2=_get_float("CALIBER158_ADAM_BETA2", 0.999),
@@ -174,6 +177,9 @@ def load_student_env() -> StudentEnv:
         lr_schedule=lr_schedule,
         lr_min=_get_float("CALIBER158_LR_MIN", 1e-5),
         lr_rel_threshold=_get_float("CALIBER158_LR_REL_THRESHOLD", 0.01),
+        lr_min2=_get_float("CALIBER158_LR_MIN2", 3e-5),
+        lr_rel_threshold2=_get_float("CALIBER158_LR_REL_THRESHOLD2", 0.001),
+        grad_clip_max_norm=_get_float("CALIBER158_GRAD_CLIP", 0.0),
     )
 
 

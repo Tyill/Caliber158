@@ -67,30 +67,53 @@ def _maybe_decay_lr_on_rel(
     env: StudentEnv,
     rel: float,
     *,
-    lr_reduced: bool,
-) -> bool:
-    """Drop LR to lr_min once holdout rel crosses below lr_rel_threshold."""
-    if env.lr_schedule != "rel_decay" or lr_reduced:
-        return lr_reduced
-    if rel >= env.lr_rel_threshold:
-        return False
-    old_lr = _optimizer_lr(optimizer)
-    _set_optimizer_lr(optimizer, env.lr_min)
-    print(
-        f"lr_decay: rel_holdout={rel} < {env.lr_rel_threshold}, "
-        f"lr {old_lr} -> {env.lr_min}"
-    )
-    return True
+    lr_decay_stage: int,
+) -> int:
+    """Two-stage rel_decay: threshold -> lr_min, then threshold2 -> lr_min2."""
+    if env.lr_schedule != "rel_decay":
+        return lr_decay_stage
+    if lr_decay_stage < 1 and rel < env.lr_rel_threshold:
+        old_lr = _optimizer_lr(optimizer)
+        _set_optimizer_lr(optimizer, env.lr_min)
+        print(
+            f"lr_decay stage1: rel_holdout={rel} < {env.lr_rel_threshold}, "
+            f"lr {old_lr} -> {env.lr_min}"
+        )
+        return 1
+    if (
+        lr_decay_stage < 2
+        and env.lr_rel_threshold2 > 0.0
+        and rel < env.lr_rel_threshold2
+    ):
+        old_lr = _optimizer_lr(optimizer)
+        _set_optimizer_lr(optimizer, env.lr_min2)
+        print(
+            f"lr_decay stage2: rel_holdout={rel} < {env.lr_rel_threshold2}, "
+            f"lr {old_lr} -> {env.lr_min2}"
+        )
+        return 2
+    return lr_decay_stage
+
+
+def _initial_lr_decay_stage(env: StudentEnv, lr: float) -> int:
+    if env.lr_schedule != "rel_decay":
+        return 0
+    if env.lr_rel_threshold2 > 0.0 and lr <= env.lr_min2:
+        return 2
+    if lr <= env.lr_min:
+        return 1
+    return 0
 
 
 def _make_scheduler(
     optimizer: torch.optim.AdamW,
     env: StudentEnv,
+    epochs: int,
 ) -> torch.optim.lr_scheduler.LRScheduler | None:
     if env.lr_schedule == "cosine":
         return torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=env.epochs,
+            T_max=epochs,
             eta_min=env.lr_min,
         )
     return None
@@ -126,7 +149,13 @@ def _log_startup(
         env.lr_schedule,
         (
             f" lr_min={env.lr_min} rel_threshold={env.lr_rel_threshold}"
+            f" lr_min2={env.lr_min2} rel_threshold2={env.lr_rel_threshold2}"
             if env.lr_schedule == "rel_decay"
+            else ""
+        ),
+        (
+            f" grad_clip={env.grad_clip_max_norm}"
+            if env.grad_clip_max_norm > 0.0
             else ""
         ),
         sep="",
@@ -156,6 +185,67 @@ def _log_epoch(
     )
 
 
+def _clip_grads(model: MicroNet, env: StudentEnv) -> None:
+    if env.grad_clip_max_norm <= 0.0:
+        return
+    torch.nn.utils.clip_grad_norm_(_model_params(model, env.arch), env.grad_clip_max_norm)
+
+
+def _run_epochs(
+    model: MicroNet,
+    optimizer: torch.optim.AdamW,
+    env: StudentEnv,
+    train_x: torch.Tensor,
+    train_y: torch.Tensor,
+    holdout_meta: HoldoutSplit,
+) -> None:
+    n = train_x.shape[0]
+    has_holdout = holdout_meta.holdout.n_samples > 0
+    scheduler = _make_scheduler(optimizer, env, env.epochs)
+    lr_decay_stage = _initial_lr_decay_stage(env, _optimizer_lr(optimizer))
+
+    for epoch in range(env.epochs):
+        model.train()
+        total_loss = 0.0
+        batches = 0
+        start = 0
+        while start < n:
+            count = batch_count(n, start, env.batch_size)
+            if count == 0:
+                break
+            xb = train_x[start : start + count]
+            yb = train_y[start : start + count]
+            optimizer.zero_grad()
+            loss = model.train_batch_loss(xb, yb)
+            loss.backward()
+            _clip_grads(model, env)
+            optimizer.step()
+            total_loss += float(loss.item())
+            batches += 1
+            start += env.batch_size
+
+        if scheduler is not None:
+            scheduler.step()
+
+        if epoch % env.log_every == 0 or epoch == env.epochs - 1:
+            avg = total_loss / batches if batches else 0.0
+            if has_holdout:
+                model.eval()
+                holdout_mse, rel = _eval_holdout(model, holdout_meta, model.gate.device)
+                _log_epoch(
+                    epoch,
+                    avg,
+                    holdout_mse,
+                    rel,
+                    lr=_optimizer_lr(optimizer) if env.lr_schedule == "rel_decay" else None,
+                )
+                lr_decay_stage = _maybe_decay_lr_on_rel(
+                    optimizer, env, rel, lr_decay_stage=lr_decay_stage
+                )
+            else:
+                _log_epoch(epoch, avg, 0.0, 0.0)
+
+
 def train_chain(env: StudentEnv, data: ChainDataset, *, use_holdout: bool = True) -> None:
     device = torch.device(env.device)
     if use_holdout:
@@ -180,56 +270,14 @@ def train_chain(env: StudentEnv, data: ChainDataset, *, use_holdout: bool = True
         block2_init=env.block2_init,
         block2_init_scale=env.block2_init_scale,
     ).to(device)
-    optimizer = _make_optimizer(model, env)
-    scheduler = _make_scheduler(optimizer, env)
-    lr_reduced = env.lr_schedule == "rel_decay" and env.learning_rate <= env.lr_min
-
     _log_startup(env, model, train_data, holdout_meta)
 
     train_x = torch.from_numpy(train_data.x).to(device)
     train_y = torch.from_numpy(train_data.y).to(device)
-    n = train_data.n_samples
     has_holdout = holdout_meta.holdout.n_samples > 0
 
-    for epoch in range(env.epochs):
-        model.train()
-        total_loss = 0.0
-        batches = 0
-        start = 0
-        while start < n:
-            count = batch_count(n, start, env.batch_size)
-            if count == 0:
-                break
-            xb = train_x[start : start + count]
-            yb = train_y[start : start + count]
-            optimizer.zero_grad()
-            loss = model.train_batch_loss(xb, yb)
-            loss.backward()
-            optimizer.step()
-            total_loss += float(loss.item())
-            batches += 1
-            start += env.batch_size
-
-        if scheduler is not None:
-            scheduler.step()
-
-        if epoch % env.log_every == 0 or epoch == env.epochs - 1:
-            avg = total_loss / batches if batches else 0.0
-            if has_holdout:
-                model.eval()
-                holdout_mse, rel = _eval_holdout(model, holdout_meta, device)
-                _log_epoch(
-                    epoch,
-                    avg,
-                    holdout_mse,
-                    rel,
-                    lr=_optimizer_lr(optimizer) if env.lr_schedule == "rel_decay" else None,
-                )
-                lr_reduced = _maybe_decay_lr_on_rel(
-                    optimizer, env, rel, lr_reduced=lr_reduced
-                )
-            else:
-                _log_epoch(epoch, avg, 0.0, 0.0)
+    optimizer = _make_optimizer(model, env)
+    _run_epochs(model, optimizer, env, train_x, train_y, holdout_meta)
 
     if has_holdout:
         model.eval()
@@ -282,6 +330,9 @@ def cmd_smoke(env: StudentEnv) -> None:
         lr_schedule=env.lr_schedule,
         lr_min=env.lr_min,
         lr_rel_threshold=env.lr_rel_threshold,
+        lr_min2=env.lr_min2,
+        lr_rel_threshold2=env.lr_rel_threshold2,
+        grad_clip_max_norm=env.grad_clip_max_norm,
     )
     train_chain(smoke_env, data, use_holdout=False)
 
