@@ -18,6 +18,8 @@ from student.dataset import ChainDataset, read_dataset, synthetic
 from student.holdout import HoldoutSplit, split_holdout
 from student.metrics import batch_count, relative_mse
 from student.model import MicroNet
+from student.teacher_init import load_exact_teacher_vectors
+from student.coord_desc_init import find_cd_init_from_teacher_quant
 
 
 def _model_params(model: MicroNet, arch: str) -> list[torch.nn.Parameter]:
@@ -143,6 +145,10 @@ def _log_startup(
         env.quantize_label,
         " arch=",
         env.arch,
+        " init=",
+        env.weight_init,
+        " ste=",
+        env.ste_mode,
         " block2_init=",
         env.block2_init,
         " lr_schedule=",
@@ -151,6 +157,11 @@ def _log_startup(
             f" lr_min={env.lr_min} rel_threshold={env.lr_rel_threshold}"
             f" lr_min2={env.lr_min2} rel_threshold2={env.lr_rel_threshold2}"
             if env.lr_schedule == "rel_decay"
+            else ""
+        ),
+        (
+            f" cd_sweeps={env.cd_sweeps}"
+            if env.weight_init == "cd"
             else ""
         ),
         (
@@ -260,21 +271,80 @@ def train_chain(env: StudentEnv, data: ChainDataset, *, use_holdout: bool = True
             var_y_holdout=0.0,
         )
 
+    train_x = torch.from_numpy(train_data.x).to(device)
+    train_y = torch.from_numpy(train_data.y).to(device)
+
+    teacher_gate = None
+    teacher_up = None
+    cd_gate = None
+    cd_up = None
+    cd_alpha = None
+    if env.weight_init == "teacher":
+        print(
+            "loading teacher init: model=",
+            env.model_name,
+            " layer=",
+            env.layer,
+            " neuron=",
+            env.neuron,
+            sep="",
+        )
+        teacher_gate, teacher_up = load_exact_teacher_vectors(
+            env.model_name,
+            env.layer,
+            env.neuron,
+        )
+    elif env.weight_init == "cd":
+        print(
+            "cd init: model=",
+            env.model_name,
+            " layer=",
+            env.layer,
+            " neuron=",
+            env.neuron,
+            " sweeps=",
+            env.cd_sweeps,
+            sep="",
+        )
+        gate_fp, up_fp = load_exact_teacher_vectors(
+            env.model_name,
+            env.layer,
+            env.neuron,
+        )
+        cd_gate, cd_up, cd_alpha = find_cd_init_from_teacher_quant(
+            gate_fp,
+            up_fp,
+            train_x,
+            train_y,
+            max_sweeps=env.cd_sweeps,
+        )
+
     model = MicroNet(
         data.input_dim,
         env.hidden_dim,
         arch=env.arch,
         use_ternary=env.use_ternary,
         ternary_threshold=env.ternary_threshold,
+        ste_mode=env.ste_mode,
         init_scale=env.init_scale,
         block2_init=env.block2_init,
         block2_init_scale=env.block2_init_scale,
+        weight_init=env.weight_init,
+        teacher_gate=teacher_gate,
+        teacher_up=teacher_up,
+        cd_gate=cd_gate,
+        cd_up=cd_up,
+        cd_alpha=cd_alpha,
     ).to(device)
     _log_startup(env, model, train_data, holdout_meta)
 
-    train_x = torch.from_numpy(train_data.x).to(device)
-    train_y = torch.from_numpy(train_data.y).to(device)
     has_holdout = holdout_meta.holdout.n_samples > 0
+    if has_holdout and env.weight_init == "cd":
+        model.eval()
+        pre_holdout, pre_rel = _eval_holdout(model, holdout_meta, device)
+        print(
+            f"pre_train holdout_mse={pre_holdout} rel_holdout={pre_rel} (cd init, before STE)"
+        )
 
     optimizer = _make_optimizer(model, env)
     _run_epochs(model, optimizer, env, train_x, train_y, holdout_meta)
@@ -333,6 +403,11 @@ def cmd_smoke(env: StudentEnv) -> None:
         lr_min2=env.lr_min2,
         lr_rel_threshold2=env.lr_rel_threshold2,
         grad_clip_max_norm=env.grad_clip_max_norm,
+        weight_init=env.weight_init,
+        layer=env.layer,
+        neuron=env.neuron,
+        ste_mode=env.ste_mode,
+        cd_sweeps=env.cd_sweeps,
     )
     train_chain(smoke_env, data, use_holdout=False)
 

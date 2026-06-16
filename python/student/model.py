@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -33,9 +34,16 @@ class MicroNet(nn.Module):
         arch: str = "v0",
         use_ternary: bool = True,
         ternary_threshold: float = 0.0,
+        ste_mode: str = "plain",
         init_scale: float = 0.1,
         block2_init: str = "zero",
         block2_init_scale: float | None = None,
+        weight_init: str = "lcg",
+        teacher_gate: np.ndarray | None = None,
+        teacher_up: np.ndarray | None = None,
+        cd_gate: np.ndarray | None = None,
+        cd_up: np.ndarray | None = None,
+        cd_alpha: float | None = None,
     ) -> None:
         super().__init__()
         if arch not in _ALL_ARCHES:
@@ -45,10 +53,16 @@ class MicroNet(nn.Module):
         self.arch = arch
         self.use_ternary = use_ternary
         self.ternary_threshold = ternary_threshold
+        if ste_mode not in {"plain", "masked"}:
+            raise ValueError(f"unsupported ste_mode: {ste_mode}")
+        self.ste_mode = ste_mode
         if block2_init not in {"zero", "lcg"}:
             raise ValueError(f"unsupported block2_init: {block2_init}")
+        if weight_init not in {"lcg", "teacher", "cd"}:
+            raise ValueError(f"unsupported weight_init: {weight_init}")
         self.block2_init = block2_init
         self.block2_init_scale = block2_init_scale
+        self.weight_init = weight_init
 
         if arch == "exact":
             self.gate = nn.Parameter(torch.empty(1, input_dim))
@@ -59,7 +73,12 @@ class MicroNet(nn.Module):
             self.w_res = nn.Parameter(torch.empty(0))
             self.beta = nn.Parameter(torch.empty(0))
             self.alpha = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
-            self._init_exact_weights(init_scale)
+            if weight_init == "teacher":
+                self._init_exact_teacher_weights(teacher_gate, teacher_up)
+            elif weight_init == "cd":
+                self._init_exact_cd_weights(cd_gate, cd_up, cd_alpha)
+            else:
+                self._init_exact_weights(init_scale)
             return
 
         gate_size = hidden_dim * input_dim
@@ -87,6 +106,42 @@ class MicroNet(nn.Module):
         with torch.no_grad():
             self.gate.copy_(torch.from_numpy(w["gate"]).reshape(1, self.input_dim))
             self.up.copy_(torch.from_numpy(w["up"]).reshape(1, self.input_dim))
+
+    def _init_exact_teacher_weights(
+        self,
+        gate_w: np.ndarray | None,
+        up_w: np.ndarray | None,
+    ) -> None:
+        """Shadow init from Qwen gate/up rows (FP32); ternary applied in forward."""
+        if gate_w is None or up_w is None:
+            raise ValueError("teacher init requires teacher_gate and teacher_up vectors")
+        if gate_w.shape != (self.input_dim,) or up_w.shape != (self.input_dim,):
+            raise ValueError(
+                f"teacher gate/up shape mismatch: gate={gate_w.shape} up={up_w.shape} "
+                f"expected ({self.input_dim},)"
+            )
+        with torch.no_grad():
+            self.gate.copy_(torch.from_numpy(gate_w.astype(np.float32)).reshape(1, self.input_dim))
+            self.up.copy_(torch.from_numpy(up_w.astype(np.float32)).reshape(1, self.input_dim))
+
+    def _init_exact_cd_weights(
+        self,
+        gate_w: np.ndarray | None,
+        up_w: np.ndarray | None,
+        alpha: float | None,
+    ) -> None:
+        """Shadow init from CD ternary gate/up; alpha from CD fit on train."""
+        if gate_w is None or up_w is None or alpha is None:
+            raise ValueError("cd init requires cd_gate, cd_up, and cd_alpha")
+        if gate_w.shape != (self.input_dim,) or up_w.shape != (self.input_dim,):
+            raise ValueError(
+                f"cd gate/up shape mismatch: gate={gate_w.shape} up={up_w.shape} "
+                f"expected ({self.input_dim},)"
+            )
+        with torch.no_grad():
+            self.gate.copy_(torch.from_numpy(gate_w.astype(np.float32)).reshape(1, self.input_dim))
+            self.up.copy_(torch.from_numpy(up_w.astype(np.float32)).reshape(1, self.input_dim))
+            self.alpha.fill_(float(alpha))
 
     def _init_lcg_weights(
         self,
@@ -130,6 +185,7 @@ class MicroNet(nn.Module):
             use_ternary=self.use_ternary,
             training=self.training,
             threshold=self.ternary_threshold,
+            ste_mode=self.ste_mode,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

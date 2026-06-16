@@ -1,34 +1,190 @@
 # Handoff для следующего чата
 
-Обновлено: 2026-06-17 (production target: **`arch=exact`**; FP32 diagnostic ✅; warm-start ❌)
+Обновлено: 2026-06-17 (**pivot → arch v2 shared FFN**; v1 per-chain `exact` ❌ @ Phase 1 ternary)
 
-> **План v1:** детальная спецификация реализации — в `.cursor/plans/architecture_v1_swiglu_7baef79e.plan.md`. HANDOFF — статус и контекст, не дублировать расходящийся детальный план.
+> **План v1:** per-chain micro-net — `.cursor/plans/architecture_v1_swiglu_7baef79e.plan.md`, `docs/architecture.md` § legacy. **Frozen** (infra остаётся, не production path).
+>
+> **План v2:** **shared weights, layer-wise FFN** — спека ниже § «Architecture v2». Детальный implementation plan — TBD (`.cursor/plans/` или `docs/architecture-v2.md`).
 
 ## Идея проекта
 
-Аппроксимировать Qwen **не прямой заменой весов**, а локальной дистилляцией: каждая скалярная MLP-цепочка `hidden → SwiGLU → 1` заменяется отдельной тернарной micro-сетью `{-1,0,1}` + один обучаемый масштаб **α** (FP32).
+Аппроксимировать Qwen **не прямой заменой весов**, а **дистилляцией** в тернарные `{-1,0,1}` + FP32 scale(s).
 
-Первый target: **Qwen2.5-0.5B** (`hidden=896`, `intermediate=4864`, `24` слоя → **116 736** MLP-цепочек).
+**Teacher:** Qwen2.5-0.5B — `hidden=896`, `intermediate=4864`, **24** слоя.
 
-Подробнее: `docs/target.md`, `docs/architecture.md`, `docs/product-goals.md`, `docs/qwen2.5-0.5b.md`.
+| Поколение | Unit of distill | Статус |
+|-----------|-----------------|--------|
+| **v1 (per-chain)** | 116 736 scalar chain → micro-net / chain | ❌ ternary Phase 1; legacy infra |
+| **v2 (shared layer)** | **1 FFN block / layer** — shared matrices | ✅ **production target** (2026-06-17) |
 
-### Production target: `exact`
+Подробнее: `docs/target.md`, `docs/product-goals.md`, `docs/qwen2.5-0.5b.md`, `lerning_compare.md` § session 2.
 
-**Решение (2026-06-17):** целевая production-форма — **`CALIBER158_ARCH=exact`**, не v0/v1 с bottleneck `H`.
+### v1 per-chain — итог (закрыто для production)
 
-| | `exact` | v0 H=16 (legacy) |
-|--|---------|------------------|
-| Форма | teacher-shaped: `α·SiLU(w_g·x)·(w_u·x)` | bottleneck `D→H→1` |
-| Params / chain | **1 793** | 28 689 |
-| Total @ 116k chains | **~209M** (~0.2–0.8 GB) | **~3.35B** (~3 GB) |
-| vs Qwen 0.5B | **меньше** | **больше** |
+**Было (2026-06-17 утро):** production = **`arch=exact`** (1793 params/chain, ~209M total).
 
-- **Torch:** `exact` ✅ (`python/student/model.py`)
-- **Mojo:** `exact` ❌ — **следующий порт**; сейчас stack v0/v1
-- **Phase 1 ternary @ 100k:** `rel≈1` и для v0, и для exact — **STE блокер**, не выбор arch
-- **FP32 @ 100k:** capacity доказана (#100k-h) — **диагностика**, не аргумент за v0 vs exact
+**Session 2 (2026-06-17):** ternary `exact` **не тянет** Phase 1:
 
-Спека: `docs/architecture.md` § «Production target: exact».
+| Метод | holdout rel @ 100k L00_N0000 |
+|-------|------------------------------|
+| STE + Adam (best, grad_clip=1.0) | ~**0.76** |
+| Oracle CD (best ternary в `{-1,0,1}`) | ~**0.44** |
+| Phase 1 target | **< 0.001** |
+| FP32 v0 H=128 + rel_decay | **0.00073** ✅ (но **26.8B** total — size fail) |
+
+**Вывод:** representational floor ~0.44 + STE plateau ~0.76 → **менять форму**, не STE sweeps.  
+Per-chain × 116k @ rel≈1 **не масштабировать** как path к student.
+
+Детали: `lerning_compare.md` § «exact ternary STE R&D session 2», D6/D6b.
+
+### Production target: **v2 shared FFN layer**
+
+**Решение (2026-06-17):** student = **один тернарный FFN на слой** (shared gate/up/down), как у Qwen — **не** 116k независимых micro-net.
+
+Спека: § «Architecture v2» ниже.
+
+---
+
+## Architecture v2 — shared FFN layer (spec)
+
+### Мотивация
+
+| v1 per-chain | v2 shared layer |
+|--------------|-----------------|
+| `total = 116736 × params_per_chain` | `total ≈ 24 × params_per_layer` (+ attention позже) |
+| Scalar `y` на neuron | Vector **FFN output** `[896]` |
+| 116k `.bin`, 116k train jobs | **1 extract + 1 train / layer** |
+| exact ternary floor **rel≈0.44** (oracle) | Teacher-shaped **full matmul** — capacity как у Qwen FFN |
+
+### Student forward (один FFN block, layer `L`)
+
+Symbols: `D=896`, `I=4864` (Qwen2.5-0.5B).
+
+```
+x [B, D]                           # input to FFN (post-norm hidden)
+gate = TernaryLinear(D → I)(x)     # W_gate [I, D] shadow → STE
+up   = TernaryLinear(D → I)(x)     # W_up   [I, D]
+h    = SiLU(gate) ⊙ up             # [B, I]
+y    = TernaryLinear(I → D)(h)     # W_down [D, I]
+out  = y                           # Phase 1 target (см. residual ниже)
+```
+
+**Optional (Phase 1b+):** `out = x + y` (residual), если target extract включает skip.
+
+**Weights:** FP32 shadow + STE ternary в forward; **без** per-chain `α` (масштаб — через shadow / опц. per-channel FP32 scales, TBD).
+
+### Teacher target (extract)
+
+На `N` samples (default **100k**, holdout 10% @ seed 42):
+
+| Поле | Shape | Как получить |
+|------|-------|--------------|
+| `X` | `[N, D]` | Random `N(0,1)` (как chain v1) **или** activations из forward teacher (TBD) |
+| `Y` | `[N, D]` | `down(SiLU(X W_g^T) ⊙ (X W_u^T))` — **FFN output до residual** |
+
+Primary Phase 1: MSE между student `y` и teacher `Y`, **mean over batch and dims**.
+
+**Не** scalar chain `SiLU(w_g·x)·(w_u·x)` для одного neuron.
+
+### Размер (Qwen2.5-0.5B)
+
+**Full-rank ternary (teacher shapes):**
+
+| Matrix | Shape | Params |
+|--------|-------|--------|
+| `W_gate` | I×D | 4 358 144 |
+| `W_up` | I×D | 4 358 144 |
+| `W_down` | D×I | 4 358 144 |
+| **Per layer** | | **13 074 432 (~13.1M)** |
+| **24 FFN layers** | | **~314M** |
+
+| vs Qwen ~0.5B | ternary packed (~2 bit) |
+|---------------|---------------------------|
+| **Меньше** bf16 ~1 GB | order **~80 MB** FFN-only (314M×2bit) |
+
+**Low-rank variant (R&D fallback):** `W ≈ A @ B`, rank `r`:
+
+```
+params_per_proj ≈ r × (D + I) = r × 5760
+params_per_layer ≈ 3 × r × 5760 = 17280 × r
+```
+
+| r | / layer | 24 layers |
+|---|---------|-----------|
+| 64 | ~1.1M | ~**26M** |
+| 128 | ~2.2M | ~**53M** |
+| 256 | ~4.4M | ~**106M** |
+
+Full-rank v2 **всё ещё < Qwen** по total params; low-rank — запас по RAM.
+
+### Phase 1 (v2 gate)
+
+| | |
+|--|--|
+| **Unit** | **Layer 0 FFN** (не `L00_N0000` chain) |
+| **Data** | `N=100k`, holdout 10%, seed 42 |
+| **Criterion** | `rel_holdout < 0.001` где `rel = MSE / mean(Var(Y[:, d]))` по dim **или** scalar MSE/Var(flatten Y) — **зафиксировать в первом Torch PR** (default: mean variance по 896 dims) |
+| **Backend** | Torch first → Mojo после breakthrough |
+| **Quant** | Ternary STE (reuse `ternary.py` pattern, batched matmul) |
+
+### Dataset wire format (v2, **новый контракт**)
+
+**Не** reuse scalar `CAL158` chain `.bin` (version 1, `Y [N]`).
+
+Proposal **`CAL158L`** (layer FFN, version TBD):
+
+```
+magic     = b"CAL158L"   # или CAL158 version=2 + type tag — зафиксировать в PR
+n_samples, input_dim D, output_dim D_out   # Phase 1: D_out=D=896
+X float32 [N × D]
+Y float32 [N × D_out]
+sidecar .json: model, layer, seed, target_kind=ffn_out
+```
+
+Path example: `data/layers/L00_ffn.bin`.
+
+**v1** `data/chains/L00_N0000.bin` — **legacy / frozen**, не Phase 2 @ scale.
+
+### Env (proposal)
+
+| Var | Meaning |
+|-----|---------|
+| `CALIBER158_DISTILL_UNIT` | `chain` (v1 legacy) \| `layer_ffn` (v2) |
+| `CALIBER158_LAYER` | 0…23 |
+| `CALIBER158_FFN_RANK` | `0` = full rank; `>0` = low-rank r |
+| (reuse) | `SAMPLES`, `SEED`, `HOLDOUT_FRACTION`, `LR`, `DEVICE`, STE knobs |
+
+### Implementation roadmap
+
+| Step | Deliverable | Layer |
+|------|-------------|-------|
+| **V2-1** | `extract_layer_ffn.py` + `CAL158L` write/read | Python host |
+| **V2-2** | `TernaryFFNLayer` + `train_layer.py` (Torch) | Python R&D |
+| **V2-3** | Phase 1 @ L0, 100k, ternary STE | Torch |
+| **V2-4** | FP32 diagnostic control (optional) | Torch |
+| **V2-5** | Mojo: ternary matmul `D→I`, `I→D`, GPU batch | kernel |
+| **V2-6** | Layers 1…23, checkpoint, assembly sketch | host |
+| **V2-7** | Attention / full block | Phase 3+ |
+
+**Не приоритет:** порт v1 `exact` в Mojo; Phase 2 batch extract 4864 chains; train 116k per-chain @ rel≈1.
+
+### Reuse from v1
+
+| Component | v2 |
+|-----------|-----|
+| STE / shadow / AdamW | ✅ pattern |
+| Holdout LCG split | ✅ |
+| pixi, Makefile discipline | ✅ |
+| Mojo GPU train loop | ⚠️ новые kernel sizes (I=4864) |
+| `micro_net_batch`, chain `.bin` | legacy only |
+
+### Open decisions (resolve in V2-1 PR)
+
+1. Target: FFN `y` only vs `x + y` residual.
+2. `X` sampling: Gaussian vs real activations.
+3. `rel` for vector `Y`: per-dim mean vs flatten.
+4. Per-channel FP32 scales (BitNet-style) — yes/no Phase 1.
+5. Full-rank vs low-rank default for first experiment.
 
 ---
 
@@ -195,18 +351,19 @@ CLI: `info | smoke | train | test-grad | test-grad-gpu` — v1 при `CALIBER15
 
 ## Текущая фаза
 
-**Phase 1**: одна цепочка `L00_N0000`, **production arch = `exact`**.
+**Phase 1 (v2):** **layer 0 FFN**, shared ternary weights, **100k** samples.
 
-Критерий успеха: holdout MSE < 1e-4 (или `rel_holdout < 0.001`).
+Критерий успеха: `rel_holdout < 0.001` на vector FFN output `[896]` (см. § Architecture v2).
 
-| Path | Статус @ 100k | Роль |
-|------|---------------|------|
-| **FP32** (Torch `QUANTIZE=0`, diagnostic) | ✅ `rel=0.00073` (#100k-h) — capacity OK | **не гоняем** как primary R&D |
-| **Ternary `exact`** (production target) | ❌ `rel≈1` (#100k-k/z) | **Phase 1 blocker** — STE |
-| **Ternary v0/v1** (legacy Mojo stack) | ❌ `rel≈1` | infra / parity; **не production arch** |
-| **Mojo `exact`** | ❌ не портирован | **следующий код** |
+| Path | Статус | Роль |
+|------|--------|------|
+| **v2 ternary FFN** (production target) | ❌ не реализован | **следующий R&D + код** |
+| **v1 ternary per-chain** (`exact`/v0) | ❌ floor ~0.44 / STE ~0.76 | **legacy**, не масштабировать |
+| **v1 FP32 v0 H=128** | ✅ `rel=0.00073` | capacity diagnostic only |
+| **Mojo v1** (v0/v1 micro-net) | ✅ infra | legacy train path |
+| **Mojo v2 FFN** | ❌ | после Torch Phase 1 |
 
-Детали — `lerning_compare.md` § «100k re-extract», § «rel_decay», § «exact vs v0».
+Детали v1: `lerning_compare.md` § session 2. Спека v2: § «Architecture v2» выше.
 
 ---
 
@@ -216,22 +373,24 @@ CLI: `info | smoke | train | test-grad | test-grad-gpu` — v1 при `CALIBER15
 
 **Сделано:** CPU + GPU v1, tests, holdout #6, docs — см. секцию «Архитектура v1» выше.
 
-**Не сделано / вне scope:**
+**Не сделано / вне scope (v1):**
 
 | Задача | Примечание |
 |--------|------------|
-| Phase 1 ternary **`exact`** @ 100k (`rel < 0.001`) | ❌ `rel≈1` — **приоритет** (STE) |
-| ~~Phase 1 FP32~~ | ✅ доказано (#100k-h); diagnostic only |
-| ~~Warm-start FP32→ternary~~ | ❌ negative; **удалено из кода** |
-| ~~Re-extract 100k~~ | ✅ |
-| **Порт `exact` в Mojo** (CPU + GPU, tests) | **следующий код** |
-| **Ternary STE @ 100k на `exact`** (Torch → Mojo) | **следующий R&D** |
-| **Порт rel_decay** в Mojo train | после ternary breakthrough |
-| v0/v1 Mojo stack | ✅ legacy; не production target |
-| Checkpoint export (+ поле `arch`) | после quality ok |
-| Phase 2 batch extract | отдельно |
-| README sync | устарел |
-| `test_gradcheck_tiny.py` в gate | optional |
+| Phase 1 ternary per-chain | ❌ **closed** — pivot v2 |
+| ~~Порт `exact` в Mojo~~ | **отменён** как priority |
+| Phase 2 batch extract 4864 chains | **отменён** @ v1; v2 = 1 bin/layer |
+| v0/v1 Mojo stack | ✅ legacy |
+| Checkpoint export (chain) | superseded by layer checkpoint (v2 TBD) |
+
+**v2 — не сделано:**
+
+| Задача | Step |
+|--------|------|
+| `extract_layer_ffn.py` + `CAL158L` | V2-1 |
+| Torch `TernaryFFNLayer` + train | V2-2, V2-3 |
+| Phase 1 ternary @ L0 100k | V2-3 |
+| Mojo v2 FFN kernels | V2-5 |
 
 **Команды v1:**
 
@@ -245,62 +404,62 @@ CALIBER158_ARCH=v1 CALIBER158_HIDDEN_DIM=512 CALIBER158_EPOCHS=30 \
 
 ## Что делать дальше (приоритет)
 
-### 1. Phase 1 — **ternary `exact`** (production path)
+### 1. **v2 Phase 1** — shared ternary FFN layer 0 (Torch)
 
-**Факт:** FP32 доказал capacity @ 100k. Ternary v0 и ternary `exact` → `rel≈1` — **STE блокер**, не H и не exact vs v0. Warm-start не помог.
+| Step | Действие |
+|------|----------|
+| **V2-1** | `extract_layer_ffn.py` + read/write `CAL158L`; `data/layers/L00_ffn.bin` @ 100k |
+| **V2-2** | `TernaryFFNLayer` (full-rank D→I→D), STE, AdamW, holdout |
+| **V2-3** | Train @ 100k; gate `rel_holdout < 0.001` |
+| **V2-4** | (опц.) FP32 control; (опц.) low-rank `FFN_RANK=128` |
 
-| Шаг | Действие |
-|-----|----------|
-| **A** | STE / init / quant гипотезы на **`arch=exact` @ 100k** (Torch) |
-| **B** | Grad clip для ternary `exact` @ 100k |
-| **C** | **Порт `exact` в Mojo** — `BatchMicroNet`, GPU kernels, `make test-grad-exact` |
-| **D** | Порт **rel_decay** в Mojo (`CALIBER158_LR_SCHEDULE=rel_decay`) |
-| **E** | Mojo `train-cuda` на **100k** `.bin` с **`CALIBER158_ARCH=exact`** |
+**Не делаем:** v1 STE sweeps; Mojo exact port; 4864 chain extract @ v1.
 
-**Не гоняем:** FP32 sweeps как primary R&D; warm-start; v0/v1 как production target.
-
-**Baseline Torch:**
+**Целевая команда (после V2-1…2):**
 
 ```bash
-CALIBER158_ARCH=exact CALIBER158_EPOCHS=20 CALIBER158_LR=0.0003 \
-  CALIBER158_WEIGHT_DECAY=0.001 make train-torch
+# TBD — example
+CALIBER158_DISTILL_UNIT=layer_ffn CALIBER158_LAYER=0 CALIBER158_SAMPLES=100000 \
+  make extract-layer
+CALIBER158_EPOCHS=20 CALIBER158_LR=0.0003 CALIBER158_WEIGHT_DECAY=0.001 \
+  make train-torch-layer
 ```
 
-### 2. Checkpoint export (нет в коде)
+### 2. Mojo v2 FFN (после Torch Phase 1 ✅)
 
-После успешного train — сохранять gate/up/head ternary, shadow (опц.), α, chain_id → `data/checkpoints/L00_N0000.bin` (формат не спроектирован). На GPU path: `GpuTrainState.download_shadow()` уже есть для чтения весов с device.
+- Ternary matmul `896→4864`, SwiGLU, `4864→896`
+- `make test-grad-ffn`, GPU train layer 0 @ 100k
 
-### 3. Phase 2 — batch extract layer 0
+### 3. Layers 1…23 + checkpoint + assembly (Phase 2+)
 
-- `batch_extract.py`: 4864 цепочек → `L00_N####.bin`
-- Параллельный train worker pool
-- `data/chains/manifest.jsonl`
-
-### 4. Phase 3+
-
-- Сборка тернарного MLP слоя, 24 слоя FFN, attention — отдельно
+### 4. Attention / full transformer block (Phase 3+)
 
 ### 5. Документация
 
-- **README** устарел: всё ещё `micro_net.mojo`, 3584/~530k chains, нет `DEVICE`/Makefile/GPU/`test-grad-gpu`
-- Обновить layout в README под `micro_net_batch`, `gpu/`, `Makefile`
+- **README** sync (v1 legacy + v2 target)
+- `docs/architecture.md` — pointer на v2 (или `docs/architecture-v2.md`)
 
 ---
 
 ## PyTorch student prototype (parallel, не замена Mojo)
 
-**Статус: ternary-only R&D на production arch `exact`** (FP32 diagnostic ✅; warm-start ❌).
+**Статус v1:** per-chain R&D **закрыт** (#100k-m…t, D6 — `lerning_compare.md`).
 
-**Зачем Torch:** быстрые эксперименты **ternary `exact`** @ 100k до порта в Mojo. Default arch для R&D: **`exact`**. `QUANTIZE=0` — rare FP32 control only.
+**Статус v2:** **следующий Torch path** — `TernaryFFNLayer` + layer extract (§ Architecture v2).
+
+**v1 Torch (legacy, не удалять):** `python/student/` — `MicroNet` v0/v1/exact, `train_chain.py`, `make train-torch`.
 
 **Сделано:**
 
 - 100k dataset, holdout, `rel_decay`, grad_clip env
 - FP32 diagnostic (#100k-h, #100k-n) — **закрыто**, код Torch без FP32 path
 - Warm-start — **удалён** (не помог)
-- Прогоны #T*, #100k-* — `lerning_compare.md`
+- Session 2: `INIT=teacher|cd`, `STE=masked`, `diag_ternary_fit.py`, `coord_desc_init.py`
+- Прогоны #100k-m…t, D6/D6b — `lerning_compare.md`
 
-**Следующий эксперимент:** ternary STE гипотезы @ **`arch=exact`**, 100k.
+**v2 Torch (planned):** `extract_layer_ffn.py`, `TernaryFFNLayer`, `train_layer.py`.
+
+**Следующий код:** V2-1 extract + V2-2 train layer 0.
 
 ### Контракт паритета с Mojo (обязательно)
 
@@ -379,14 +538,18 @@ scripts/run-test-torch-parity.sh
 - [x] **#100k-h FP32 v0 + rel_decay** — **Phase 1 ✅** `rel=0.00073`
 - [x] LR schedule `rel_decay` в Torch (`train_chain.py`, env)
 
-#### Этап 5 — Ternary `exact` + Mojo port (следующий)
+#### Этап 5 — Ternary `exact` per-chain ❌ (2026-06-17, closed)
 
-- [ ] STE / init гипотезы ternary **`exact`** @ 100k
-- [ ] Grad clip @ 100k ternary `exact`
-- [ ] **Порт `exact` в Mojo** (CPU + GPU, tests)
-- [ ] Порт rel_decay в Mojo train
-- [ ] Mojo train на 100k `.bin` с `CALIBER158_ARCH=exact`
-- [x] ~~Warm-start~~ — удалено (negative)
+- [x] STE / init / grad_clip / masked STE / CD / CD→STE — **negative** (lerning_compare § session 2)
+- [x] Oracle CD floor ~0.44 — representational limit
+- [ ] ~~Порт exact Mojo~~ — **cancelled** (pivot v2)
+
+#### Этап 6 — **v2 shared FFN layer** (следующий)
+
+- [ ] V2-1 extract `CAL158L` + layer 0 dataset
+- [ ] V2-2 Torch `TernaryFFNLayer` + train loop
+- [ ] V2-3 Phase 1 @ 100k ternary
+- [ ] V2-5 Mojo FFN kernels
 
 #### Этап 6 — Optional hardening (частично)
 
@@ -422,10 +585,10 @@ CALIBER158_ARCH=exact CALIBER158_EPOCHS=20 CALIBER158_LR=0.0003 \
 
 ### Порядок работ vs Mojo
 
-1. **Ternary `exact`** эксперименты в Torch @ 100k
-2. **Порт `exact`** в Mojo (CPU + GPU)
-3. Порт **rel_decay** в Mojo train
-4. Mojo остаётся production runtime + `make test`
+1. **v2 Torch** — layer 0 FFN Phase 1
+2. **v2 Mojo** — FFN kernels + train
+3. v1 chain code — **frozen**, `make test` без регрессии
+4. Layers 1…23, assembly, attention — позже
 
 ---
 
@@ -478,9 +641,10 @@ make smoke-torch       # Torch synthetic smoke
 
 ## Известные ограничения / техдолг
 
-- Phase 1: **STE ternary — блокер** @ 100k на **`exact`** (и v0); FP32 diagnostic `rel=0.00073` (#100k-h)
-- `L00_N0000.bin` — **100k** (342 MB); Mojo train на 100k **не прогонялся** с новыми LR
-- README не синхронизирован с кодом
+- **v1 per-chain ternary** — floor ~0.44 (CD), STE ~0.76; **не production path**
+- **v2** — spec only; extract/train **не реализованы**
+- v1 `L00_N0000.bin` @ 100k — legacy dataset for chain R&D
+- README не синхронизирован (v1 + v2)
 - `mojo build` требует **видимый NVIDIA GPU** при compile (CI workaround — v2.1)
 - `make test` не включает `test-grad-gpu` (runtime GPU); build всё равно тянет GPU-модули
 - GPU grad regression: допуск **1e-4** (не 1e-5) из‑за float32 reorder в parallel matmul
@@ -505,14 +669,13 @@ make smoke-torch       # Torch synthetic smoke
 | Нет per-batch upload весов/`X` | ✅ один upload at start |
 | Checkpoint export | ❌ |
 | Holdout + relative MSE | ✅ `CALIBER158_HOLDOUT_FRACTION`, `lerning_compare.md` |
-| Phase 1 ternary **`exact`** (`rel < 0.001`) | ❌ 100k ≈1 — STE blocker |
-| Phase 1 FP32 @ 100k (#100k-h) | ✅ diagnostic `rel=0.00073` |
-| Re-extract 100k | ✅ |
-| Torch #100k sweep | ✅ `lerning_compare.md` |
-| **`exact` в Mojo** | ❌ **следующий порт** |
-| Mojo train @ 100k `exact` | ❌ после порта |
-| Production target **`exact`** (docs) | ✅ `docs/architecture.md` |
-| Legacy v0/v1 (Mojo CPU + GPU) | ✅ `CALIBER158_ARCH=v0/v1` |
+| Phase 1 v2 ternary FFN L0 | ❌ not started |
+| Phase 1 v1 ternary per-chain | ❌ closed (~0.44 floor) |
+| Phase 1 v1 FP32 @ 100k (#100k-h) | ✅ diagnostic `rel=0.00073` |
+| Production target | **v2 shared FFN** (HANDOFF § Architecture v2) |
+| Legacy v0/v1 Mojo | ✅ |
+| v1 Torch (chain) | ✅ frozen |
+| **`exact` Mojo port** | ❌ **cancelled** |
 | `make test-grad-v1` / `test-grad-gpu-v1` | ✅ |
 | Teacher `make extract` без регрессии | ✅ (код не менялся) |
 | Torch student prototype (v0/v1, parity) | ✅ `make test-torch-parity` |

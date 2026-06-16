@@ -124,6 +124,11 @@ class StudentEnv:
     lr_min2: float
     lr_rel_threshold2: float
     grad_clip_max_norm: float
+    weight_init: str
+    layer: int
+    neuron: int
+    ste_mode: str
+    cd_sweeps: int
 
     @property
     def quantize_label(self) -> str:
@@ -148,6 +153,14 @@ def load_student_env() -> StudentEnv:
         lr_schedule = "none"
     block2_scale_raw = os.environ.get("CALIBER158_BLOCK2_INIT_SCALE")
     block2_init_scale = float(block2_scale_raw) if block2_scale_raw is not None else None
+    weight_init = _get("CALIBER158_INIT", "lcg").strip().lower()
+    if weight_init not in {"lcg", "teacher", "cd"}:
+        weight_init = "lcg"
+    if weight_init in {"teacher", "cd"} and arch != "exact":
+        raise ValueError(f"CALIBER158_INIT={weight_init} requires CALIBER158_ARCH=exact")
+    ste_mode = _get("CALIBER158_STE", "plain").strip().lower()
+    if ste_mode not in {"plain", "masked"}:
+        ste_mode = "plain"
     learning_rate = _get_float("CALIBER158_LR", 0.001)
     return StudentEnv(
         hidden_dim=_get_int("CALIBER158_HIDDEN_DIM", 128),
@@ -180,6 +193,11 @@ def load_student_env() -> StudentEnv:
         lr_min2=_get_float("CALIBER158_LR_MIN2", 3e-5),
         lr_rel_threshold2=_get_float("CALIBER158_LR_REL_THRESHOLD2", 0.001),
         grad_clip_max_norm=_get_float("CALIBER158_GRAD_CLIP", 0.0),
+        weight_init=weight_init,
+        layer=_get_int("CALIBER158_LAYER", 0),
+        neuron=_get_int("CALIBER158_NEURON", 0),
+        ste_mode=ste_mode,
+        cd_sweeps=_get_int("CALIBER158_CD_SWEEPS", 10),
     )
 
 

@@ -1,6 +1,6 @@
 # Сравнение прогонов обучения — L00_N0000
 
-Обновлено: 2026-06-17 (100k; FP32 v0 + rel_decay → Phase 1 ✅; ternary ❌)
+Обновлено: 2026-06-17 (exact ternary floor ~0.44; CD→STE ❌; production exact ternary blocked)
 
 **Датасет (актуальный):** `data/chains/L00_N0000.bin` — **100 000 samples** (342 MB), re-extract 2026-06-17  
 **Датасет (история):** прогоны #1–#T15 и §4k-holdout — **4096 samples** (14 MB)  
@@ -19,7 +19,7 @@
 | Split @ seed 42 | **90 000 train / 10 000 holdout** |
 
 | **Критерий Phase 1:** holdout MSE < 1e-4 **или** `rel_holdout = MSE / Var(Y) < 0.001` (0.1% дисперсии).  
-**Статус (100k, Torch):** ✅ **FP32 v0 H=128 + rel_decay** (#100k-h) `rel=0.00073`; ❌ **ternary** ≈1.0.
+**Статус (100k, Torch):** ✅ **FP32 v0 H=128 + rel_decay** (#100k-h) `rel=0.00073`; ❌ **ternary exact** floor ~0.44 (CD oracle), STE plateau ~0.76–1.0.
 
 ---
 
@@ -754,8 +754,8 @@ CALIBER158_LR_SCHEDULE=rel_decay \
 2. **FP32 v0 H=128 + rel_decay (3e-4→1e-4 @ rel<0.01)** — **Phase 1 ✅** `rel=0.00073` (#100k-h).
 3. **Constant LR=3e-4 FP32** — `rel≈0.005` (#100k-e); **ternary** — `rel≈1` при любых LR/WD.
 4. **rel_decay** помогает только если phase1 **достигает rel<0.01** (FP32 v0 да; ternary/exact — нет).
-5. **arch exact** — хуже v0 bottleneck (FP32 rel≈0.23, ternary ≈0.95); не приоритет.
-6. **Production (ternary):** warm-start FP32 → quantize; порт rel_decay в Mojo; Mojo train @ 100k.
+5. **arch exact** — см. § «exact ternary STE R&D session 2» (floor ~0.44 CD oracle; STE ~0.76).
+6. ~~warm-start~~ удалён; exact ternary breakthrough **не найден** (см. #100k-t, D6).
 
 ```bash
 # Re-extract
@@ -771,3 +771,176 @@ CALIBER158_ARCH=v0 CALIBER158_QUANTIZE=0 CALIBER158_HIDDEN_DIM=128 \
 CALIBER158_ARCH=v0 CALIBER158_HIDDEN_DIM=128 CALIBER158_EPOCHS=20 \
   CALIBER158_LR=0.0003 CALIBER158_WEIGHT_DECAY=0.001 make train-torch
 ```
+
+---
+
+## exact ternary STE R&D (2026-06-17, session 2)
+
+**Production target:** `CALIBER158_ARCH=exact` (1793 params/chain).  
+**Общие env (если не указано):** 100k, holdout 10% @ seed 42 (90k/10k), `LR=3e-4`, `WD=0.001`, Torch CUDA.
+
+**Torch-only env:** `CALIBER158_INIT=lcg|teacher|cd`, `CALIBER158_STE=plain|masked`, `CALIBER158_GRAD_CLIP`, `CALIBER158_CD_SWEEPS`.
+
+### #100k-m — exact ternary baseline (повтор #100k-k) ❌
+
+| Env | `arch=exact`, `rel_decay`, 20 ep |
+
+| Best rel | **0.947** ep 11 |
+| Final | **1.025** |
+| Wall | ~29 с |
+
+### #100k-n — exact ternary + `GRAD_CLIP=1.0` ❌
+
+| Best rel | **0.774** ep 14 |
+| Final | **0.776** |
+| vs #100k-m | ~18% лучше best |
+
+**Вывод:** grad clip — первый сигнал ниже плато ~1.0; до 0.001 далеко.
+
+### #100k-o — exact ternary + `GRAD_CLIP=0.1` ❌
+
+| Best rel | 0.848 ep 15 |
+| Final | **1.225** |
+
+**Вывод:** слишком жёсткий clip хуже clip=1.0.
+
+### #100k-p — exact ternary + `GRAD_CLIP=1.0`, **50 ep** ❌
+
+| Best rel | **0.763** ep 40 |
+| Final | **0.776** ep 19 |
+| vs 20 ep (#100k-n) | marginal (~1.4% лучше best) |
+
+**Вывод:** **0.76–0.78 — потолок** plain STE + grad_clip; больше ep не помогает (осцилляция ep 20–50).
+
+### #100k-q — `INIT=teacher` (Qwen FP32 gate/up) + ternary STE ❌
+
+| Best rel | **0.759** ep 15 |
+| Final | **1.953** |
+
+**Диагностика 0 train:**
+
+| Forward | holdout rel |
+|---------|-------------|
+| Teacher FP32 shadow | **0.0** |
+| Teacher shadow + ternary quant, α=1 | **12.7M** (артефакт масштаба) |
+| Teacher shadow + ternary quant, α fitted | **0.651** |
+
+**Вывод:** rel=12M был при α=1; ternary quant teacher + fitted α → rel≈0.65. STE всё равно уводит в ~0.76, как LCG.
+
+### #100k-r — `STE=masked`, threshold=0 ❌
+
+| Best / Final rel | **0.774 / 0.776** |
+
+**Вывод:** при threshold=0 masked ≈ plain STE (маска только для shadow==0).
+
+### #100k-s — `STE=masked`, `TERNARY_THRESHOLD=0.01` ❌
+
+| Best rel | 1.003 ep 1 |
+| Final | **1.003** (заморозка) |
+
+**Вывод:** masked + threshold → мгновенный plateau @ predict mean.
+
+---
+
+## Диагностика D6 — best ternary fit (CD oracle)
+
+**Скрипт:** `python/student/diag_ternary_fit.py`  
+**Метод:** coordinate descent gate/up ∈ `{-1,0,1}`, α аналитически на train; holdout eval.
+
+### D6 — baselines + CD ×3 sweeps
+
+| Case | holdout rel |
+|------|-------------|
+| Teacher FP32 | **0.0** |
+| Ternary quant teacher (thresh=0), α fitted | **0.651** |
+| Ternary quant teacher (thresh=0.01), α fitted | **0.441** |
+| LCG ternary quant | **1.003** |
+| CD from teacher quant ×3 | **0.460** |
+| CD from LCG ternary ×3 | **0.680** |
+
+### D6b — CD ×10 sweeps
+
+| Case | holdout rel |
+|------|-------------|
+| CD from teacher quant ×10 | **0.465** (train продолжает падать, holdout плато) |
+| CD from LCG ×10 | **0.458** |
+| **Лучший overall** | **teacher quant thresh=0.01 → 0.441** |
+
+**Вывод D6/D6b:**
+
+1. **Target в ternary space существует** — oracle CD / quant+α → rel≈**0.44–0.46**, не 12M.
+2. **STE plateau ~0.76 хуже oracle ~0.46** — Adam не находит хороший ternary fit.
+3. **Floor exact ternary ≈ rel 0.44** для L00_N0000 — до Phase 1 (0.001) ~×440; **representational**, не только optimizer.
+4. Простой quant teacher (thresh=0.01) **лучше** 10 sweeps CD.
+
+---
+
+### #100k-t — `INIT=cd` (CD×10) → STE fine-tune ❌
+
+| Env | `INIT=cd`, `CD_SWEEPS=10`, `GRAD_CLIP=1.0`, 20 ep |
+
+| pre_train (CD, 0 ep STE) | **rel=0.465** |
+| epoch 0 (1 ep STE) | **rel=0.848** |
+| Best @ STE | **0.757** ep 17 |
+| Final | **0.969** |
+
+**Wall:** ~5.3 min (CD ~5 min + train ~40 с)
+
+**Вывод:** **STE ломает CD init** за 1 ep; fine-tune не улучшает oracle, final хуже старта. CD и gradient STE **несовместимы** в текущей постановке.
+
+```bash
+# exact ternary baseline
+CALIBER158_ARCH=exact CALIBER158_EPOCHS=20 CALIBER158_LR=0.0003 \
+  CALIBER158_WEIGHT_DECAY=0.001 make train-torch
+
+# grad clip (best STE env-only)
+CALIBER158_ARCH=exact CALIBER158_GRAD_CLIP=1.0 CALIBER158_EPOCHS=20 \
+  CALIBER158_LR=0.0003 CALIBER158_WEIGHT_DECAY=0.001 make train-torch
+
+# CD init → STE
+CALIBER158_ARCH=exact CALIBER158_INIT=cd CALIBER158_CD_SWEEPS=10 \
+  CALIBER158_GRAD_CLIP=1.0 CALIBER158_EPOCHS=20 CALIBER158_LR=0.0003 \
+  CALIBER158_WEIGHT_DECAY=0.001 make train-torch
+
+# CD oracle diagnostic
+bash scripts/run-python.sh python/student/diag_ternary_fit.py --max-sweeps 10
+```
+
+---
+
+## Сводная 100k + exact STE R&D (2026-06-17)
+
+| ID | Arch | Init / STE | Extra | Best rel | Final rel | Phase 1 |
+|----|------|------------|-------|----------|-----------|---------|
+| #100k-c | v0 | tern | — | 1.002 | 1.242 | ❌ |
+| #100k-d | v0 | tern | WD=0.01 | 1.002 | 1.440 | ❌ |
+| #100k-e | v0 | fp32 | — | 0.0039 | 0.0049 | ⚠️ |
+| #100k-f | v0 | tern | LR=1e-4 | 1.002 | 1.009 | ❌ |
+| #100k-g | v0 | fp32 | H=256 | 0.0046 | 0.0041 | ⚠️ |
+| **#100k-h** | v0 | **fp32** | **rel_decay** | **0.00094** | **0.00073** | **✅** |
+| #100k-i | v0 | fp32 | rel_decay LR=0.003 | 0.034 | 0.048 | ❌ |
+| #100k-j | v0 | tern | rel_decay | 1.002 | 1.242 | ❌ |
+| #100k-k | exact | tern | rel_decay | 0.947 | 1.025 | ❌ |
+| #100k-l | exact | fp32 | rel_decay | 0.234 | 0.233 | ❌ |
+| #100k-m | exact | tern | rel_decay (repeat k) | 0.947 | 1.025 | ❌ |
+| #100k-n | exact | tern | grad_clip=1.0 | **0.774** | 0.776 | ❌ |
+| #100k-o | exact | tern | grad_clip=0.1 | 0.848 | 1.225 | ❌ |
+| #100k-p | exact | tern | grad_clip=1.0, 50ep | **0.763** | 0.776 | ❌ |
+| #100k-q | exact | tern | init=teacher | 0.759 | 1.953 | ❌ |
+| #100k-r | exact | tern | STE=masked, th=0 | 0.774 | 0.776 | ❌ |
+| #100k-s | exact | tern | STE=masked, th=0.01 | 1.003 | 1.003 | ❌ |
+| **D6b** | exact | **CD oracle** | 10 sweeps | **0.441–0.465** | — | ❌ |
+| #100k-t | exact | tern | init=cd→STE | 0.757 | 0.969 | ❌ |
+
+---
+
+## Выводы exact ternary (2026-06-17, финал session 2)
+
+1. **STE + Adam plateau ~0.76–1.0** на exact @ 100k (grad_clip=1.0 — лучший env-only).
+2. **CD oracle floor ~0.44** — ternary target **существует**, но далеко от Phase 1 (0.001).
+3. **Teacher init / masked STE / больше ep** — не прорыв; CD→STE **ломает** oracle за 1 ep.
+4. **FP32 v0 + rel_decay** остаётся единственным Phase 1 ✅ (#100k-h); **не production ternary**.
+5. **Production exact ternary** @ Phase 1 **заблокирован** representational floor + STE incompatibility с CD.
+6. **Следующий код (HANDOFF):** порт `exact` в Mojo — infra; quality breakthrough ternary exact **не найден**.
+
+---
