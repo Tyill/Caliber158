@@ -5,7 +5,7 @@ from .buffer import ChainData
 from .device import DeviceKind, cuda_available
 from .grads import ModelGrads
 from .gpu.batch_step import train_step_gpu
-from .gpu.device import GpuDevice
+from .gpu.buffer_pool import GpuTrainState
 from .micro_net_batch import BatchMicroNet
 from .rng import lcg_next, unit_float
 
@@ -57,19 +57,18 @@ def _train_epochs_cpu(
 
 def _train_epochs_gpu(
     mut model: BatchMicroNet,
-    mut optimizer: AdamWState,
-    mut grads: ModelGrads,
     data: ChainData,
     config: TrainConfig,
 ) raises -> None:
-    var gpu = GpuDevice()
+    var state = GpuTrainState(data, model, config.batch_size)
+    var adamw_cfg = config.adamw_config()
+
     for epoch in range(config.epochs):
         var total_loss: Float32 = 0.0
         var batches = 0
         var i = 0
         while i < data.n_samples:
-            var loss = train_step_gpu(model, gpu, data, i, config.batch_size, grads)
-            optimizer.apply(model, grads, config.adamw_config())
+            var loss = train_step_gpu(state, i, config.batch_size, adamw_cfg)
             total_loss += loss
             batches += 1
             i += config.batch_size
@@ -84,13 +83,6 @@ def train_chain(
     config: TrainConfig,
 ) raises -> None:
     """Epoch loop with STE + AdamW."""
-    var optimizer = AdamWState.from_model(model)
-    var grads = ModelGrads.zeros(
-        len(model.gate_shadow),
-        len(model.up_shadow),
-        len(model.head_shadow),
-    )
-
     var use_gpu = config.device.is_cuda() and cuda_available()
 
     print(
@@ -108,8 +100,14 @@ def train_chain(
     )
 
     if use_gpu:
-        _train_epochs_gpu(model, optimizer, grads, data, config)
+        _train_epochs_gpu(model, data, config)
     else:
+        var optimizer = AdamWState.from_model(model)
+        var grads = ModelGrads.zeros(
+            len(model.gate_shadow),
+            len(model.up_shadow),
+            len(model.head_shadow),
+        )
         _train_epochs_cpu(model, optimizer, grads, data, config)
 
 

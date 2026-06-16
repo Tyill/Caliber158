@@ -6,7 +6,7 @@
 PIXI := pixi run
 MOJO := $(PIXI) mojo
 
-.PHONY: help install setup setup-python build check test test-grad smoke smoke-cpu smoke-cuda \
+.PHONY: help install setup setup-python build check test test-grad test-grad-gpu smoke smoke-cpu smoke-cuda \
 	info extract train train-cpu train-cuda clean
 
 help: ## Show targets
@@ -37,6 +37,9 @@ check: build ## Narrow check after Mojo edits (alias for build)
 
 test-grad: build ## Regression: batched grads vs reference (< 1e-5)
 	$(PIXI) test-grad
+
+test-grad-gpu: build ## GPU backward vs CPU batch (< 1e-5); needs CUDA runtime
+	$(PIXI) test-grad-gpu
 
 smoke: build ## Quick synthetic train (device from CALIBER158_DEVICE)
 	$(PIXI) smoke

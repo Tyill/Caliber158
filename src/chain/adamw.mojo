@@ -96,11 +96,15 @@ struct AdamWState(Copyable, Movable):
         )
 
 
-def _one_minus_pow(base: Float32, exp: Int) -> Float32:
+def one_minus_pow(base: Float32, exp: Int) -> Float32:
     var p: Float32 = 1.0
     for _ in range(exp):
         p *= base
     return 1.0 - p
+
+
+def _one_minus_pow(base: Float32, exp: Int) -> Float32:
+    return one_minus_pow(base, exp)
 
 
 def _adamw_update_list(
