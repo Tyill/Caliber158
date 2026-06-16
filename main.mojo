@@ -6,7 +6,7 @@ from src.chain import BatchMicroNet, TrainConfig, init_random_weights, train_cha
 from src.chain.buffer import ChainData
 from src.chain.dataset import ChainDataset
 from src.chain.env import TrainEnv
-from src.chain.test_batch_grad import run_batch_grad_regression_test
+from src.chain.test_batch_grad import run_batch_grad_regression_test, run_gpu_backward_regression_test
 
 
 def print_info(env: TrainEnv) -> None:
@@ -91,6 +91,11 @@ def main() raises:
     if command == "test-grad":
         run_batch_grad_regression_test()
         print("test-grad: ok")
+        return
+
+    if command == "test-grad-gpu":
+        run_gpu_backward_regression_test()
+        print("test-grad-gpu: ok")
         return
 
     if command == "smoke":

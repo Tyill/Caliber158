@@ -86,11 +86,11 @@ def head_reduce_kernel(
 
 def scale_kernel(
     values: UnsafePointer[Float32, MutAnyOrigin],
-    scale: Float32,
+    scale: UnsafePointer[Float32, MutAnyOrigin],
     n: Int,
 ):
-    """values[i] *= scale."""
+    """values[i] *= *scale."""
     var i = Int(block_idx.x * block_dim.x + thread_idx.x)
     if i >= n:
         return
-    values[i] = values[i] * scale
+    values[i] = values[i] * scale[0]

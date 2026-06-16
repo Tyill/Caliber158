@@ -4,7 +4,10 @@ from std.testing import assert_true
 
 from .buffer import ChainData
 from .dataset import ChainDataset
+from .device import cuda_available
 from .grads import ModelGrads
+from .gpu.batch_step import backward_only_gpu
+from .gpu.buffer_pool import GpuTrainState
 from .micro_net_batch import BatchMicroNet
 from .ternary import silu, silu_derivative, ternary_matvec
 from .train import init_random_weights
@@ -142,3 +145,47 @@ def run_batch_grad_regression_test() raises -> None:
 
     assert_true(abs(loss_ref - loss_batch) < 1e-5, "loss mismatch")
     assert_true(_max_grad_diff(grads_ref, grads_batch) < 1e-5, "grad mismatch")
+
+
+def run_gpu_backward_regression_test() raises -> None:
+    if not cuda_available():
+        print("test-grad-gpu: skipped (no CUDA device)")
+        return
+
+    var dataset = ChainDataset.synthetic(128, 32)
+    var data = ChainData.from_dataset(dataset)
+    var hidden_dim = 16
+    var batch_size = 32
+
+    var model_cpu = BatchMicroNet(32, hidden_dim)
+    var model_gpu = BatchMicroNet(32, hidden_dim)
+    init_random_weights(model_cpu, 0.1)
+    init_random_weights(model_gpu, 0.1)
+
+    for i in range(len(model_cpu.gate_shadow)):
+        model_gpu.gate_shadow[i] = model_cpu.gate_shadow[i]
+        model_gpu.up_shadow[i] = model_cpu.up_shadow[i]
+    for i in range(len(model_cpu.head_shadow)):
+        model_gpu.head_shadow[i] = model_cpu.head_shadow[i]
+    model_gpu.alpha = model_cpu.alpha
+
+    var grads_cpu = ModelGrads.zeros(
+        len(model_cpu.gate_shadow),
+        len(model_cpu.up_shadow),
+        len(model_cpu.head_shadow),
+    )
+    var grads_gpu = ModelGrads.zeros(
+        len(model_gpu.gate_shadow),
+        len(model_gpu.up_shadow),
+        len(model_gpu.head_shadow),
+    )
+
+    var loss_cpu = model_cpu.train_step_cpu(data, 0, batch_size, grads_cpu)
+
+    var state = GpuTrainState(data, model_gpu, batch_size)
+    var loss_gpu = backward_only_gpu(state, 0, batch_size)
+    state.download_grads(grads_gpu)
+
+    # GPU parallel matmul may reorder float32 slightly vs CPU sequential.
+    assert_true(abs(loss_cpu - loss_gpu) < 1e-5, "gpu loss mismatch")
+    assert_true(_max_grad_diff(grads_cpu, grads_gpu) < 1e-4, "gpu grad mismatch")
