@@ -202,6 +202,40 @@
 
 ---
 
+### 6b. GPU, H=512, 30 epochs + holdout — FP32 v1 diagnostic ✅
+
+| Параметр | Значение |
+|----------|----------|
+| `CALIBER158_ARCH` | **v1** |
+| `CALIBER158_QUANTIZE` | **0** (shadow FP32, без STE ternary) |
+| `HIDDEN_DIM` | 512 |
+| `EPOCHS` | 30 |
+| `LR` | 0.003 |
+| `WEIGHT_DECAY` | 0.001 |
+| `HOLDOUT_FRACTION` | 0.1 (`SEED=42`) |
+| Params | **1 442 305** |
+| Split | **3687 train / 409 holdout** |
+
+| Epoch | train_mse | holdout_mse | rel_holdout |
+|-------|-----------|-------------|-------------|
+| 0 | 3.19 | 0.470 | 12.7 |
+| 16 | 7.06 | 0.0405 | 1.09 |
+| 18 | 0.070 | 0.0371 | 1.00 |
+| 29 | **0.0327** | **0.0372** | **1.004** |
+
+| | |
+|--|--|
+| Wall time | ~56 с |
+| Финал holdout `rel` | **1.004** |
+| vs ternary v1 #6 | **≈ то же плато** (1.03 vs 1.004) |
+| vs FP32 v0 #5b | **≈ то же** (1.004 vs 1.004) |
+
+**Заметка:** эпохи 9–15 — нестабильность (train_mse до ~2000), затем сходимость к плато. LR/WD те же, что v0/v1 ternary.
+
+**Вывод:** FP32 v1 не лучше FP32 v0 → второй SwiGLU-block @ H=512 **не даёт** выигрыша по ёмкости (ни ternary, ни FP32). Узкое место не STE; v1b / H↑ / другая init block2.
+
+---
+
 ## Сводная таблица (финальные метрики)
 
 | Прогон | H | Epochs | Train MSE | Holdout MSE | rel_holdout | Время |
@@ -213,6 +247,7 @@
 | **GPU + holdout** | **512** | **30** | **0.0321** | **0.0384** | **1.04** | **~45 с** |
 | **FP32 v0 + holdout** | **512** | **30** | **0.0327** | **0.0372** | **1.004** | **~36 с** |
 | **v1 ternary + holdout** | **512** | **30** | **0.0321** | **0.0382** | **1.03** | **~63 с** |
+| **FP32 v1 + holdout** | **512** | **30** | **0.0327** | **0.0372** | **1.004** | **~56 с** |
 
 \* train MSE / Var(Y), holdout не измерялся
 
@@ -225,7 +260,8 @@
 3. **Holdout ≈ train** на плато (`rel ~ 1.0`) → **underfit**, не overfit. Модель не выучивает teacher, а предсказывает ~среднее `Y`.
 4. **FP32 diagnostic (#5b):** `rel_holdout ≈ 1.004` — как ternary → узкое место **ёмкость v0**, не ternary.
 5. **v1 ternary (#6):** `rel_holdout ≈ 1.03` @ 1.44M params — **≈ v0**; block2 не помог за 30 ep.
-6. **Дальше:** 50 ep v1, v1b (linear skip от x), H↑, или FP32 v1 diagnostic.
+6. **FP32 v1 (#6b):** `rel_holdout ≈ 1.004` — **≈ FP32 v0 и ≈ ternary v1**; глубина v1 не даёт gain без ternary.
+7. **Дальше:** v1b (linear skip), H↑, init block2 ≠ zero, 50 ep — не «ещё FP32/ternary toggle».
 
 ---
 
@@ -236,10 +272,13 @@ make train-cuda
 # env: CALIBER158_HIDDEN_DIM=512, EPOCHS=30, LR=0.003,
 #      WEIGHT_DECAY=0.001, HOLDOUT_FRACTION=0.1, SEED=42
 
-# FP32 diagnostic (v0, no ternary quantize):
+# FP32 v0 diagnostic:
 CALIBER158_QUANTIZE=0 make train-cuda
 
-# v1 ternary (shell env overrides .env):
+# FP32 v1 diagnostic:
+CALIBER158_ARCH=v1 CALIBER158_QUANTIZE=0 make train-fp32-v1-cuda
+
+# v1 ternary:
 CALIBER158_ARCH=v1 CALIBER158_HIDDEN_DIM=512 CALIBER158_LR=0.003 \
   CALIBER158_WEIGHT_DECAY=0.001 CALIBER158_EPOCHS=30 make train-cuda
 make test-grad-v1 test-grad-gpu-v1

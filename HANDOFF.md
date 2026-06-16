@@ -101,6 +101,7 @@ quantize → forward (x_dev offset, alpha_dev) → backward → AdamW
 | `CALIBER158_ARCH`, `.env.example`, `docs/architecture.md` | ✅ |
 | `scripts/load-env.sh` — shell env не перезаписывается `.env` | ✅ |
 | Holdout прогон #6 (30 ep, H=512) | ✅ см. `lerning_compare.md` |
+| Holdout **#6b FP32 v1** (30 ep) | ✅ `rel≈1.004` — ≈ FP32 v0, ≈ ternary v1 |
 
 **Результат holdout #6:** `rel_holdout ≈ 1.03` — **≈ v0** (1.04); Phase 1 не достигнута.
 
@@ -163,7 +164,7 @@ GPU v2, holdout и **v1 (CPU+GPU) закрыты**. Качество Phase 1 **�
 |--------|------------|
 | Phase 1 quality (`rel < 0.001`) | v1 @ 30 ep ≈ v0 (#6) |
 | Holdout 50 ep v1 | план §6 — не прогонялось |
-| FP32 v1 diagnostic | `QUANTIZE=0` + `ARCH=v1` |
+| ~~FP32 v1 diagnostic~~ | ✅ #6b в `lerning_compare.md` |
 | v1b linear skip от `x` | если v1a не дотянет |
 | Checkpoint export (+ поле `arch`) | после quality ok |
 | Phase 2 batch extract | отдельно |
@@ -185,7 +186,7 @@ CALIBER158_ARCH=v1 CALIBER158_HIDDEN_DIM=512 CALIBER158_EPOCHS=30 \
 
 - **50 ep v1** (те же env, что #6)
 - **v1b:** linear skip `β·(w_res·x)` + residual на h0
-- **FP32 v1 diagnostic** — отделить ёмкость от ternary
+- **FP32 v1 diagnostic** — отделить ёмкость block2 от ternary (**сделано #6b**, rel≈1.004)
 - **H↑** (768+) при OOM → `BATCH_SIZE=32`
 
 ### 2. Checkpoint export (нет в коде)

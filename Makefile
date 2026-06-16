@@ -7,7 +7,7 @@ PIXI := pixi run
 MOJO := $(PIXI) mojo
 
 .PHONY: help install setup setup-python build check test test-grad test-grad-v1 test-grad-gpu test-grad-gpu-v1 smoke smoke-cpu smoke-cuda \
-	info extract train train-cpu train-cuda clean
+	info extract train train-cpu train-cuda train-fp32-cuda train-fp32-v1-cuda clean
 
 help: ## Show targets
 	@printf "Caliber158 — common targets (run from repo root):\n\n"
@@ -72,6 +72,12 @@ train-cpu: build ## Student train forced to CPU
 
 train-cuda: build ## Student train on CUDA (needs NVIDIA GPU at build+run)
 	CALIBER158_DEVICE=cuda $(PIXI) train
+
+train-fp32-cuda: build ## FP32 v0 diagnostic (QUANTIZE=0, holdout from .env)
+	CALIBER158_DEVICE=cuda CALIBER158_QUANTIZE=0 $(PIXI) train
+
+train-fp32-v1-cuda: build ## FP32 v1 diagnostic (ARCH=v1, QUANTIZE=0)
+	CALIBER158_DEVICE=cuda CALIBER158_ARCH=v1 CALIBER158_QUANTIZE=0 $(PIXI) train
 
 clean: ## Remove local build artifacts
 	rm -rf main.o main __pycache__ python/__pycache__ .mojo-cache
