@@ -20,25 +20,80 @@ from student.metrics import batch_count, relative_mse
 from student.model import MicroNet
 
 
+def _model_params(model: MicroNet, arch: str) -> list[torch.nn.Parameter]:
+    if arch == "exact":
+        return [model.gate, model.up, model.alpha]
+    base = [model.gate, model.up, model.head, model.alpha]
+    if arch in {"v1", "v1b"}:
+        base.extend([model.gate2, model.up2])
+    if arch == "v1b":
+        base.extend([model.w_res, model.beta])
+    return base
+
+
 def _make_optimizer(model: MicroNet, env: StudentEnv) -> torch.optim.AdamW:
-    params = [
-        {
-            "params": [
-                model.gate,
-                model.up,
-                model.head,
-                model.alpha,
-            ]
-            + ([model.gate2, model.up2] if env.arch == "v1" else []),
-            "weight_decay": env.weight_decay,
-        }
-    ]
+    params = [{"params": _model_params(model, env.arch), "weight_decay": env.weight_decay}]
     return torch.optim.AdamW(
         params,
         lr=env.learning_rate,
         betas=(env.beta1, env.beta2),
         eps=env.eps,
     )
+
+
+def _set_optimizer_lr(optimizer: torch.optim.AdamW, lr: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+
+
+def _optimizer_lr(optimizer: torch.optim.AdamW) -> float:
+    return float(optimizer.param_groups[0]["lr"])
+
+
+def _eval_holdout(
+    model: MicroNet,
+    holdout: HoldoutSplit,
+    device: torch.device,
+) -> tuple[float, float]:
+    hx = torch.from_numpy(holdout.holdout.x).to(device)
+    hy = torch.from_numpy(holdout.holdout.y).to(device)
+    holdout_mse = model.eval_mse(hx, hy)
+    rel = relative_mse(holdout_mse, holdout.var_y_holdout)
+    return holdout_mse, rel
+
+
+def _maybe_decay_lr_on_rel(
+    optimizer: torch.optim.AdamW,
+    env: StudentEnv,
+    rel: float,
+    *,
+    lr_reduced: bool,
+) -> bool:
+    """Drop LR to lr_min once holdout rel crosses below lr_rel_threshold."""
+    if env.lr_schedule != "rel_decay" or lr_reduced:
+        return lr_reduced
+    if rel >= env.lr_rel_threshold:
+        return False
+    old_lr = _optimizer_lr(optimizer)
+    _set_optimizer_lr(optimizer, env.lr_min)
+    print(
+        f"lr_decay: rel_holdout={rel} < {env.lr_rel_threshold}, "
+        f"lr {old_lr} -> {env.lr_min}"
+    )
+    return True
+
+
+def _make_scheduler(
+    optimizer: torch.optim.AdamW,
+    env: StudentEnv,
+) -> torch.optim.lr_scheduler.LRScheduler | None:
+    if env.lr_schedule == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=env.epochs,
+            eta_min=env.lr_min,
+        )
+    return None
 
 
 def _log_startup(
@@ -53,7 +108,7 @@ def _log_startup(
         " holdout_samples=",
         holdout.holdout.n_samples,
         " hidden=",
-        env.hidden_dim,
+        env.hidden_dim if env.arch != "exact" else "exact",
         " params=",
         model.param_count_total(),
         " lr=",
@@ -65,6 +120,15 @@ def _log_startup(
         env.quantize_label,
         " arch=",
         env.arch,
+        " block2_init=",
+        env.block2_init,
+        " lr_schedule=",
+        env.lr_schedule,
+        (
+            f" lr_min={env.lr_min} rel_threshold={env.lr_rel_threshold}"
+            if env.lr_schedule == "rel_decay"
+            else ""
+        ),
         sep="",
     )
     if holdout.holdout.n_samples > 0:
@@ -80,20 +144,15 @@ def _log_startup(
 def _log_epoch(
     epoch: int,
     train_mse: float,
-    model: MicroNet,
-    holdout: HoldoutSplit,
-    device: torch.device,
+    holdout_mse: float,
+    rel: float,
+    *,
+    lr: float | None = None,
 ) -> None:
-    if holdout.holdout.n_samples == 0:
-        print(f"epoch {epoch} train_mse={train_mse}")
-        return
-    hx = torch.from_numpy(holdout.holdout.x).to(device)
-    hy = torch.from_numpy(holdout.holdout.y).to(device)
-    holdout_mse = model.eval_mse(hx, hy)
-    rel = relative_mse(holdout_mse, holdout.var_y_holdout)
+    lr_suffix = f" lr={lr}" if lr is not None else ""
     print(
         f"epoch {epoch} train_mse={train_mse} "
-        f"holdout_mse={holdout_mse} rel_holdout={rel}"
+        f"holdout_mse={holdout_mse} rel_holdout={rel}{lr_suffix}"
     )
 
 
@@ -118,14 +177,19 @@ def train_chain(env: StudentEnv, data: ChainDataset, *, use_holdout: bool = True
         use_ternary=env.use_ternary,
         ternary_threshold=env.ternary_threshold,
         init_scale=env.init_scale,
+        block2_init=env.block2_init,
+        block2_init_scale=env.block2_init_scale,
     ).to(device)
     optimizer = _make_optimizer(model, env)
+    scheduler = _make_scheduler(optimizer, env)
+    lr_reduced = env.lr_schedule == "rel_decay" and env.learning_rate <= env.lr_min
 
     _log_startup(env, model, train_data, holdout_meta)
 
     train_x = torch.from_numpy(train_data.x).to(device)
     train_y = torch.from_numpy(train_data.y).to(device)
     n = train_data.n_samples
+    has_holdout = holdout_meta.holdout.n_samples > 0
 
     for epoch in range(env.epochs):
         model.train()
@@ -146,15 +210,30 @@ def train_chain(env: StudentEnv, data: ChainDataset, *, use_holdout: bool = True
             batches += 1
             start += env.batch_size
 
+        if scheduler is not None:
+            scheduler.step()
+
         if epoch % env.log_every == 0 or epoch == env.epochs - 1:
             avg = total_loss / batches if batches else 0.0
-            _log_epoch(epoch, avg, model, holdout_meta, device)
+            if has_holdout:
+                model.eval()
+                holdout_mse, rel = _eval_holdout(model, holdout_meta, device)
+                _log_epoch(
+                    epoch,
+                    avg,
+                    holdout_mse,
+                    rel,
+                    lr=_optimizer_lr(optimizer) if env.lr_schedule == "rel_decay" else None,
+                )
+                lr_reduced = _maybe_decay_lr_on_rel(
+                    optimizer, env, rel, lr_reduced=lr_reduced
+                )
+            else:
+                _log_epoch(epoch, avg, 0.0, 0.0)
 
-    if holdout_meta.holdout.n_samples > 0:
-        hx = torch.from_numpy(holdout_meta.holdout.x).to(device)
-        hy = torch.from_numpy(holdout_meta.holdout.y).to(device)
-        final_holdout = model.eval_mse(hx, hy)
-        rel = relative_mse(final_holdout, holdout_meta.var_y_holdout)
+    if has_holdout:
+        model.eval()
+        final_holdout, rel = _eval_holdout(model, holdout_meta, device)
         print(
             f"final holdout_mse={final_holdout} rel_holdout={rel} "
             "(phase1 rel target 0.001)"
@@ -198,6 +277,11 @@ def cmd_smoke(env: StudentEnv) -> None:
         split_seed=env.split_seed,
         use_ternary=env.use_ternary,
         arch=env.arch,
+        block2_init=env.block2_init,
+        block2_init_scale=env.block2_init_scale,
+        lr_schedule=env.lr_schedule,
+        lr_min=env.lr_min,
+        lr_rel_threshold=env.lr_rel_threshold,
     )
     train_chain(smoke_env, data, use_holdout=False)
 

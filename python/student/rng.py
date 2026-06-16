@@ -33,8 +33,13 @@ def init_model_weights(
     head_size: int,
     block2_size: int,
     scale: float = 0.1,
+    *,
+    w_res_size: int = 0,
+    block2_init: str = "zero",
+    block2_init_scale: float | None = None,
 ) -> dict[str, np.ndarray]:
-    """Match Mojo init_random_weights: interleaved gate/up LCG; block2 zero."""
+    """Match Mojo init_random_weights: interleaved gate/up LCG; block2 zero unless lcg."""
+    b2_scale = scale if block2_init_scale is None else block2_init_scale
     seed = _INIT_SEED
     gate = np.empty(gate_size, dtype=np.float32)
     up = np.empty(gate_size, dtype=np.float32)
@@ -47,12 +52,23 @@ def init_model_weights(
     for i in range(head_size):
         seed = lcg_next(seed)
         head[i] = (unit_float(seed) * 2.0 - 1.0) * scale
-    gate2 = np.zeros(block2_size, dtype=np.float32)
-    up2 = np.zeros(block2_size, dtype=np.float32)
+    if block2_init == "lcg" and block2_size > 0:
+        gate2 = np.empty(block2_size, dtype=np.float32)
+        up2 = np.empty(block2_size, dtype=np.float32)
+        for i in range(block2_size):
+            seed = lcg_next(seed)
+            gate2[i] = (unit_float(seed) * 2.0 - 1.0) * b2_scale
+            seed = lcg_next(seed)
+            up2[i] = (unit_float(seed) * 2.0 - 1.0) * b2_scale
+    else:
+        gate2 = np.zeros(block2_size, dtype=np.float32)
+        up2 = np.zeros(block2_size, dtype=np.float32)
+    w_res = np.zeros(w_res_size, dtype=np.float32)
     return {
         "gate": gate,
         "up": up,
         "head": head,
         "gate2": gate2,
         "up2": up2,
+        "w_res": w_res,
     }

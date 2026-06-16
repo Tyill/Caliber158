@@ -116,6 +116,11 @@ class StudentEnv:
     split_seed: int
     use_ternary: bool
     arch: str
+    block2_init: str
+    block2_init_scale: float | None
+    lr_schedule: str
+    lr_min: float
+    lr_rel_threshold: float
 
     @property
     def quantize_label(self) -> str:
@@ -129,10 +134,18 @@ def load_student_env() -> StudentEnv:
     if not dataset.is_absolute():
         dataset = ROOT / dataset
     arch = _get("CALIBER158_ARCH", "v0").strip().lower()
-    if arch not in {"v0", "v1"}:
+    if arch not in {"v0", "v1", "v1b", "exact"}:
         arch = "v0"
     quantize_raw = os.environ.get("CALIBER158_QUANTIZE", "1")
     use_ternary = quantize_raw.strip() != "0"
+    block2_init = _get("CALIBER158_BLOCK2_INIT", "zero").strip().lower()
+    if block2_init not in {"zero", "lcg"}:
+        block2_init = "zero"
+    lr_schedule = _get("CALIBER158_LR_SCHEDULE", "none").strip().lower()
+    if lr_schedule not in {"none", "cosine", "rel_decay"}:
+        lr_schedule = "none"
+    block2_scale_raw = os.environ.get("CALIBER158_BLOCK2_INIT_SCALE")
+    block2_init_scale = float(block2_scale_raw) if block2_scale_raw is not None else None
     return StudentEnv(
         hidden_dim=_get_int("CALIBER158_HIDDEN_DIM", 128),
         dataset_path=dataset,
@@ -156,6 +169,11 @@ def load_student_env() -> StudentEnv:
         split_seed=_get_int("CALIBER158_SEED", 42),
         use_ternary=use_ternary,
         arch=arch,
+        block2_init=block2_init,
+        block2_init_scale=block2_init_scale,
+        lr_schedule=lr_schedule,
+        lr_min=_get_float("CALIBER158_LR_MIN", 1e-5),
+        lr_rel_threshold=_get_float("CALIBER158_LR_REL_THRESHOLD", 0.01),
     )
 
 
