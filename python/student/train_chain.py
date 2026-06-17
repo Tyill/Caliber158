@@ -7,6 +7,7 @@ import argparse
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -14,10 +15,19 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from env_config import StudentEnv, load_student_env
+from student.chain_group import (
+    ChainGroupDataset,
+    ChainGroupTrainSplit,
+    load_chain_group_from_env,
+    per_chain_variance_y,
+    split_chain_group_holdout,
+    synthetic_chain_group,
+)
 from student.dataset import ChainDataset, read_dataset, synthetic
 from student.holdout import HoldoutSplit, split_holdout
 from student.metrics import batch_count, relative_mse
 from student.model import MicroNet
+from student.shared_model import SharedMicroNetV0
 from student.teacher_init import load_exact_teacher_vectors
 from student.coord_desc_init import find_cd_init_from_teacher_quant
 
@@ -31,6 +41,41 @@ def _model_params(model: MicroNet, arch: str) -> list[torch.nn.Parameter]:
     if arch == "v1b":
         base.extend([model.w_res, model.beta])
     return base
+
+
+def _shared_model_params(model: SharedMicroNetV0) -> list[torch.nn.Parameter]:
+    return [model.gate, model.up, model.head, model.alpha]
+
+
+def _make_shared_optimizer(
+    model: SharedMicroNetV0,
+    env: StudentEnv,
+) -> torch.optim.AdamW:
+    return torch.optim.AdamW(
+        [{"params": _shared_model_params(model), "weight_decay": env.weight_decay}],
+        lr=env.learning_rate,
+        betas=(env.beta1, env.beta2),
+        eps=env.eps,
+    )
+
+
+def _eval_holdout_group(
+    model: SharedMicroNetV0,
+    split: ChainGroupTrainSplit,
+    device: torch.device,
+) -> tuple[float, float, tuple[float, ...]]:
+    hx = torch.from_numpy(split.holdout.x).to(device)
+    hy = torch.from_numpy(split.holdout.y).to(device)
+    holdout_mse = model.eval_mse(hx, hy)
+    rel_mean = relative_mse(holdout_mse, split.var_y_holdout)
+    chain_vars = per_chain_variance_y(split.holdout.y)
+    per_chain_rel: list[float] = []
+    with torch.no_grad():
+        pred = model.forward(hx)
+        for k, var_k in enumerate(chain_vars):
+            mse_k = torch.nn.functional.mse_loss(pred[:, k], hy[:, k], reduction="mean")
+            per_chain_rel.append(relative_mse(float(mse_k.item()), var_k))
+    return holdout_mse, rel_mean, tuple(per_chain_rel)
 
 
 def _make_optimizer(model: MicroNet, env: StudentEnv) -> torch.optim.AdamW:
@@ -119,6 +164,209 @@ def _make_scheduler(
             eta_min=env.lr_min,
         )
     return None
+
+
+def _clip_shared_grads(model: SharedMicroNetV0, env: StudentEnv) -> None:
+    if env.grad_clip_max_norm <= 0.0:
+        return
+    torch.nn.utils.clip_grad_norm_(_shared_model_params(model), env.grad_clip_max_norm)
+
+
+def _log_group_startup(
+    env: StudentEnv,
+    model: SharedMicroNetV0,
+    train: ChainGroupDataset,
+    split: ChainGroupTrainSplit,
+) -> None:
+    from student.shared_model import shared_v0_param_count
+
+    indep_params = env.chain_group * shared_v0_param_count(
+        train.input_dim, env.hidden_dim, 1
+    )
+    shared_params = model.param_count_total()
+    print(
+        "training chain group: train_samples=",
+        train.n_samples,
+        " holdout_samples=",
+        split.holdout.n_samples,
+        " chain_group=",
+        env.chain_group,
+        " layer=",
+        env.layer,
+        " base_neuron=",
+        env.neuron,
+        " hidden=",
+        env.hidden_dim,
+        " params=",
+        shared_params,
+        " indep_baseline=",
+        indep_params,
+        " lr=",
+        env.learning_rate,
+        " device=",
+        env.device,
+        " backend=torch",
+        " quantize=",
+        env.quantize_label,
+        " arch=v0shared",
+        " lr_schedule=",
+        env.lr_schedule,
+        (
+            f" lr_min={env.lr_min} rel_threshold={env.lr_rel_threshold}"
+            f" lr_min2={env.lr_min2} rel_threshold2={env.lr_rel_threshold2}"
+            if env.lr_schedule == "rel_decay"
+            else ""
+        ),
+        (
+            f" grad_clip={env.grad_clip_max_norm}"
+            if env.grad_clip_max_norm > 0.0
+            else ""
+        ),
+        sep="",
+    )
+    if split.holdout.n_samples > 0:
+        print(
+            "holdout metrics: var_y_train=",
+            split.var_y_train,
+            " var_y_holdout=",
+            split.var_y_holdout,
+            sep="",
+        )
+
+
+def _log_group_epoch(
+    epoch: int,
+    train_mse: float,
+    holdout_mse: float,
+    rel: float,
+    per_chain_rel: tuple[float, ...],
+    *,
+    lr: float | None = None,
+) -> None:
+    lr_suffix = f" lr={lr}" if lr is not None else ""
+    chain_suffix = " ".join(f"rel_k{k}={r}" for k, r in enumerate(per_chain_rel))
+    print(
+        f"epoch {epoch} train_mse={train_mse} "
+        f"holdout_mse={holdout_mse} rel_holdout={rel} {chain_suffix}{lr_suffix}"
+    )
+
+
+def _run_group_epochs(
+    model: SharedMicroNetV0,
+    optimizer: torch.optim.AdamW,
+    env: StudentEnv,
+    train_x: torch.Tensor,
+    train_y: torch.Tensor,
+    split: ChainGroupTrainSplit,
+) -> None:
+    n = train_x.shape[0]
+    has_holdout = split.holdout.n_samples > 0
+    scheduler = _make_scheduler(optimizer, env, env.epochs)
+    lr_decay_stage = _initial_lr_decay_stage(env, _optimizer_lr(optimizer))
+
+    for epoch in range(env.epochs):
+        model.train()
+        total_loss = 0.0
+        batches = 0
+        start = 0
+        while start < n:
+            count = batch_count(n, start, env.batch_size)
+            if count == 0:
+                break
+            xb = train_x[start : start + count]
+            yb = train_y[start : start + count]
+            optimizer.zero_grad()
+            loss = model.train_batch_loss(xb, yb)
+            loss.backward()
+            _clip_shared_grads(model, env)
+            optimizer.step()
+            total_loss += float(loss.item())
+            batches += 1
+            start += env.batch_size
+
+        if scheduler is not None:
+            scheduler.step()
+
+        if epoch % env.log_every == 0 or epoch == env.epochs - 1:
+            avg = total_loss / batches if batches else 0.0
+            if has_holdout:
+                model.eval()
+                holdout_mse, rel, per_chain_rel = _eval_holdout_group(
+                    model, split, model.gate.device
+                )
+                _log_group_epoch(
+                    epoch,
+                    avg,
+                    holdout_mse,
+                    rel,
+                    per_chain_rel,
+                    lr=_optimizer_lr(optimizer) if env.lr_schedule == "rel_decay" else None,
+                )
+                lr_decay_stage = _maybe_decay_lr_on_rel(
+                    optimizer, env, rel, lr_decay_stage=lr_decay_stage
+                )
+            else:
+                _log_group_epoch(epoch, avg, 0.0, 0.0, ())
+
+
+def train_chain_group(
+    env: StudentEnv,
+    data: ChainGroupDataset,
+    *,
+    use_holdout: bool = True,
+) -> None:
+    device = torch.device(env.device)
+    if use_holdout:
+        split = split_chain_group_holdout(data, env.holdout_fraction, env.split_seed)
+        train_data = split.train
+    else:
+        split = ChainGroupTrainSplit(
+            train=data,
+            holdout=ChainGroupDataset(
+                0,
+                data.input_dim,
+                data.chain_group,
+                data.layer,
+                data.base_neuron,
+                data.x[:0],
+                data.y[:0],
+                data.chain_paths,
+            ),
+            var_y_train=0.0,
+            var_y_holdout=0.0,
+            shuffled_indices=np.array([], dtype=np.int64),
+            holdout_original_indices=np.array([], dtype=np.int64),
+            train_original_indices=np.array([], dtype=np.int64),
+        )
+        train_data = data
+
+    train_x = torch.from_numpy(train_data.x).to(device)
+    train_y = torch.from_numpy(train_data.y).to(device)
+
+    model = SharedMicroNetV0(
+        data.input_dim,
+        env.hidden_dim,
+        data.chain_group,
+        use_ternary=env.use_ternary,
+        ternary_threshold=env.ternary_threshold,
+        ste_mode=env.ste_mode,
+        init_scale=env.init_scale,
+    ).to(device)
+    _log_group_startup(env, model, train_data, split)
+
+    optimizer = _make_shared_optimizer(model, env)
+    _run_group_epochs(model, optimizer, env, train_x, train_y, split)
+
+    if split.holdout.n_samples > 0:
+        model.eval()
+        final_holdout, rel, per_chain_rel = _eval_holdout_group(model, split, device)
+        chain_summary = ", ".join(
+            f"N{data.base_neuron + k:04d}={r}" for k, r in enumerate(per_chain_rel)
+        )
+        print(
+            f"final holdout_mse={final_holdout} rel_holdout={rel} "
+            f"per_chain=({chain_summary}) (phase1 rel target 0.001 per chain)"
+        )
 
 
 def _log_startup(
@@ -359,6 +607,27 @@ def train_chain(env: StudentEnv, data: ChainDataset, *, use_holdout: bool = True
 
 
 def cmd_train(env: StudentEnv) -> None:
+    if env.chain_group > 1:
+        print(
+            "loading chain group:",
+            f"layer={env.layer} neuron={env.neuron}..{env.neuron + env.chain_group - 1}",
+            f"chain_group={env.chain_group}",
+        )
+        data = load_chain_group_from_env(
+            env.data_dir,
+            env.layer,
+            env.neuron,
+            env.chain_group,
+        )
+        if data.input_dim != env.hidden_size:
+            print(
+                f"note: dataset input_dim={data.input_dim} "
+                f"env CALIBER158_HIDDEN_SIZE={env.hidden_size}"
+            )
+        train_chain_group(env, data, use_holdout=True)
+        print("done")
+        return
+
     print("loading dataset:", env.dataset_path)
     data = read_dataset(env.dataset_path)
     if data.input_dim != env.hidden_size:
@@ -371,7 +640,15 @@ def cmd_train(env: StudentEnv) -> None:
 
 
 def cmd_smoke(env: StudentEnv) -> None:
-    data = synthetic(env.smoke_samples, env.hidden_size)
+    if env.chain_group > 1:
+        data = synthetic_chain_group(
+            env.smoke_samples,
+            env.hidden_size,
+            env.chain_group,
+            seed=env.split_seed,
+        )
+    else:
+        data = synthetic(env.smoke_samples, env.hidden_size)
     smoke_env = StudentEnv(
         hidden_dim=env.hidden_dim,
         dataset_path=env.dataset_path,
@@ -408,8 +685,14 @@ def cmd_smoke(env: StudentEnv) -> None:
         neuron=env.neuron,
         ste_mode=env.ste_mode,
         cd_sweeps=env.cd_sweeps,
+        chain_group=env.chain_group,
+        intermediate_size=env.intermediate_size,
+        data_dir=env.data_dir,
     )
-    train_chain(smoke_env, data, use_holdout=False)
+    if env.chain_group > 1:
+        train_chain_group(smoke_env, data, use_holdout=False)
+    else:
+        train_chain(smoke_env, data, use_holdout=False)
 
 
 def main(argv: list[str] | None = None) -> int:

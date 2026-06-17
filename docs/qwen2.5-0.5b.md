@@ -2,6 +2,8 @@
 
 First full-model approximation target before larger Qwen variants.
 
+**Next target (after Phase 1 green):** [Qwen3.6-35B-A3B](qwen3.6-35b-a3b.md).
+
 ## Model geometry (from HF config)
 
 | Parameter | Value |

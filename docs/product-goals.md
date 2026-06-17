@@ -56,8 +56,8 @@ stays ~3B. **Architecture choice is a size decision**, not only a training conve
 ### Current status (2026-06-17)
 
 - Quality path explored: FP32 v0 small `H`, ternary blocked by STE (~`rel ≈ 1`).
-- Size: **v0 + H fails** the product goal at full chain count; **exact** is the only
-  tested form with total params below Qwen.
+- **Production arch:** **v0 H=1 solo** (~209M @ 116k) — size ✅ on 0.5B and 35B-A3B active path.
+- Legacy: v0 H=16 per-chain (~3.35B) and K=16 H=26 (~343M) — **not production** (size or next-target fail).
 
 See also: [architecture.md](architecture.md), [HANDOFF.md](../HANDOFF.md),
 [lerning_compare.md](../lerning_compare.md).

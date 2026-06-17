@@ -1,6 +1,10 @@
 # Architecture: ternary micro-network
 
 Target model: **Qwen2.5-0.5B** — see [qwen2.5-0.5b.md](qwen2.5-0.5b.md).
+Next scale target: **Qwen3.6-35B-A3B** — see [qwen3.6-35b-a3b.md](qwen3.6-35b-a3b.md).
+
+**Production arch (2026-06-17):** **`v0` H=1 solo** — `HIDDEN_DIM=1`, `CHAIN_GROUP=1`, ~**209M** @ 116k chains.
+FP32 shadow until ternary STE unblocked. Details: `lerning_compare.md` § «Production arch».
 
 **Product goal:** the assembled student must be **smaller than Qwen** (disk + RAM).
 See [product-goals.md](product-goals.md).
@@ -9,53 +13,37 @@ For Qwen2.5-0.5B: `hidden = 896`, **116 736** scalar MLP chains (24 layers × 48
 
 ---
 
-## Production target: `exact`
+## Production target: `v0` H=1 solo
 
-**`CALIBER158_ARCH=exact`** — teacher-shaped scalar SwiGLU, **no hidden bottleneck H**.
+**`CALIBER158_ARCH=v0`**, **`CALIBER158_HIDDEN_DIM=1`**, **`CALIBER158_CHAIN_GROUP=1`**.
 
-One chain approximates the same function as one Qwen MLP neuron path:
-
-```
-f(x) = SiLU(w_gate · x) · (w_up · x)
-```
-
-### Student (`exact`)
+Minimal bottleneck micro-net per scalar chain — same total params as teacher-shaped `exact`
+(~1.8k/chain, ~209M @ 116k) but **Phase 1 trainable** (FP32 shadow; ternary STE still blocked).
 
 ```
-x [D=896]
-  ├─ TernaryLinear(1 × D)  →  gate   (dot product → scalar)
-  └─ TernaryLinear(1 × D)  →  up     (dot product → scalar)
-  out = α · SiLU(gate) · up
+x [D] → gate/up (1×H linear) → SiLU· → head (H→1) → α
 ```
 
 | Item | Value |
 |------|--------|
-| Params / chain | **1 793** (2×896 + α) |
-| Total @ 116k chains | **~209M** (~0.2–0.8 GB) — **below Qwen ~0.5B / ~1 GB** |
-| `HIDDEN_DIM` | ignored (`hidden=exact` in logs) |
-| Weights | FP32 shadow → `{-1,0,1}` via STE |
-| Loss | MSE vs teacher `Y` |
-| Optimizer | AdamW + STE |
+| Params / chain | **1 794** (`2·H·D + H + 1`, H=1) |
+| Total @ 116k | **~209M** — below Qwen ~0.5B |
+| 35B-A3B active assembled | **~2.6B** — below 3B active |
 
-### Implementation status
+**Train (gate + pilot):** Torch `make train-torch`, `QUANTIZE=0`, `LR_SCHEDULE=rel_decay`.
 
-| Layer | `exact` |
-|-------|---------|
-| Torch (`python/student/model.py`) | ✅ train + holdout |
-| Mojo (`BatchMicroNet`, GPU) | ❌ **not ported** — production blocker |
-| Phase 1 ternary @ 100k | ❌ `rel≈1` (#100k-k/z) — STE blocker (same as v0) |
+### Legacy candidate: `exact` (not production)
 
-**R&D default:** Torch `make train-torch` with `CALIBER158_ARCH=exact`.
-
-**Production default (target):** Mojo `make train-cuda` with `arch=exact` once ported.
+**`CALIBER158_ARCH=exact`** — teacher-shaped scalar SwiGLU, **no hidden bottleneck H**.
+Total size OK (~209M) but **Phase 1 train fails** (rel≈0.19–0.23 @ 100k); closed for train.
+See § below for `exact` spec (diagnostic / teacher-init only).
 
 ---
 
-## Legacy / R&D: v0 and v1 (bottleneck H)
+## Student v0 (bottleneck H)
 
-v0/v1 use a **wider bottleneck** `H` (hidden micro-layer). Useful for infra bring-up and
-historical experiments; **not** the production architecture — total size **exceeds Qwen**
-at full chain count (e.g. v0 H=16 → **~3.35B** params).
+v0 micro-net with bottleneck `H`. **Production: H=1.** Wider H and chain groups (K>1) —
+R&D only; size fail @ 116k when H>1 without sharing, or @ 35B-A3B when K=16 H=26.
 
 ### Original teacher function (one neuron)
 
@@ -78,7 +66,7 @@ x [D]
 
 | Parameter | Notes |
 |-----------|--------|
-| `H` | bottleneck width; **deprecated for production** |
+| `H` | bottleneck width; **production = 1**; H>1 R&D only (size fail @ 116k) |
 | Params @ H=16 | 28 689 / chain |
 | Mojo | ✅ CPU + GPU (`CALIBER158_ARCH=v0`, default today) |
 

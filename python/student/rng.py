@@ -72,3 +72,47 @@ def init_model_weights(
         "up2": up2,
         "w_res": w_res,
     }
+
+
+def init_ffn_shadow(
+    input_dim: int,
+    intermediate_dim: int,
+    scale: float = 0.1,
+) -> dict[str, np.ndarray]:
+    """LCG init for full-rank FFN shadow weights (gate/up/down)."""
+    seed = _INIT_SEED
+    gate = np.empty((intermediate_dim, input_dim), dtype=np.float32)
+    up = np.empty((intermediate_dim, input_dim), dtype=np.float32)
+    down = np.empty((input_dim, intermediate_dim), dtype=np.float32)
+    for arr in (gate, up, down):
+        for i in range(arr.size):
+            seed = lcg_next(seed)
+            arr.ravel()[i] = (unit_float(seed) * 2.0 - 1.0) * scale
+    return {"gate": gate, "up": up, "down": down}
+
+
+def init_ffn_lowrank_shadow(
+    input_dim: int,
+    intermediate_dim: int,
+    rank: int,
+    scale: float = 0.1,
+) -> dict[str, np.ndarray]:
+    """LCG init for low-rank FFN factors (A [I,r], B [r,D] per projection)."""
+    seed = _INIT_SEED
+
+    def fill(shape: tuple[int, ...]) -> np.ndarray:
+        nonlocal seed
+        arr = np.empty(shape, dtype=np.float32)
+        for i in range(arr.size):
+            seed = lcg_next(seed)
+            arr.ravel()[i] = (unit_float(seed) * 2.0 - 1.0) * scale
+        return arr
+
+    return {
+        "gate_a": fill((intermediate_dim, rank)),
+        "gate_b": fill((rank, input_dim)),
+        "up_a": fill((intermediate_dim, rank)),
+        "up_b": fill((rank, input_dim)),
+        "down_a": fill((input_dim, rank)),
+        "down_b": fill((rank, intermediate_dim)),
+    }

@@ -129,6 +129,9 @@ class StudentEnv:
     neuron: int
     ste_mode: str
     cd_sweeps: int
+    chain_group: int
+    intermediate_size: int
+    data_dir: Path
 
     @property
     def quantize_label(self) -> str:
@@ -158,9 +161,31 @@ def load_student_env() -> StudentEnv:
         weight_init = "lcg"
     if weight_init in {"teacher", "cd"} and arch != "exact":
         raise ValueError(f"CALIBER158_INIT={weight_init} requires CALIBER158_ARCH=exact")
+    if arch == "exact" and weight_init != "teacher":
+        raise ValueError(
+            "CALIBER158_ARCH=exact train is closed (FP32 plateau rel≈0.19–0.23; "
+            "LR/epoch sweep 2026-06-17). Use CALIBER158_ARCH=v0; shared bottleneck: "
+            "CALIBER158_CHAIN_GROUP>1. Teacher diagnostic only: CALIBER158_INIT=teacher."
+        )
     ste_mode = _get("CALIBER158_STE", "plain").strip().lower()
     if ste_mode not in {"plain", "masked"}:
         ste_mode = "plain"
+    chain_group = _get_int("CALIBER158_CHAIN_GROUP", 1)
+    if chain_group < 1:
+        raise ValueError(f"CALIBER158_CHAIN_GROUP must be >= 1, got {chain_group}")
+    if chain_group > 1 and arch != "v0":
+        raise ValueError("CALIBER158_CHAIN_GROUP>1 requires CALIBER158_ARCH=v0")
+    intermediate_size = _get_int("CALIBER158_INTERMEDIATE_SIZE", 4864)
+    layer = _get_int("CALIBER158_LAYER", 0)
+    neuron = _get_int("CALIBER158_NEURON", 0)
+    if neuron + chain_group > intermediate_size:
+        raise ValueError(
+            f"neuron {neuron} + chain_group {chain_group} exceeds "
+            f"intermediate_size {intermediate_size}"
+        )
+    data_dir = Path(_get("CALIBER158_DATA_DIR", "data/chains"))
+    if not data_dir.is_absolute():
+        data_dir = ROOT / data_dir
     learning_rate = _get_float("CALIBER158_LR", 0.001)
     return StudentEnv(
         hidden_dim=_get_int("CALIBER158_HIDDEN_DIM", 128),
@@ -194,10 +219,13 @@ def load_student_env() -> StudentEnv:
         lr_rel_threshold2=_get_float("CALIBER158_LR_REL_THRESHOLD2", 0.001),
         grad_clip_max_norm=_get_float("CALIBER158_GRAD_CLIP", 0.0),
         weight_init=weight_init,
-        layer=_get_int("CALIBER158_LAYER", 0),
-        neuron=_get_int("CALIBER158_NEURON", 0),
+        layer=layer,
+        neuron=neuron,
         ste_mode=ste_mode,
         cd_sweeps=_get_int("CALIBER158_CD_SWEEPS", 10),
+        chain_group=chain_group,
+        intermediate_size=intermediate_size,
+        data_dir=data_dir,
     )
 
 
@@ -243,4 +271,160 @@ def load_env() -> CaliberEnv:
         seed=_get_int("CALIBER158_SEED", 42),
         data_dir=data_dir,
         synthetic=_get_bool("CALIBER158_SYNTHETIC", False),
+    )
+
+
+@dataclass(frozen=True)
+class LayerExtractEnv:
+    model: str
+    hidden_size: int
+    intermediate_size: int
+    num_layers: int
+    layer: int
+    samples: int
+    seed: int
+    data_dir: Path
+    synthetic: bool
+    extract_batch_size: int
+
+    @property
+    def layer_filename(self) -> str:
+        return f"L{self.layer:02d}_ffn.bin"
+
+    @property
+    def default_dataset_path(self) -> Path:
+        return self.data_dir / self.layer_filename
+
+
+def load_layer_extract_env() -> LayerExtractEnv:
+    """Load v2 layer FFN extract config from CALIBER158_*."""
+    apply_huggingface_paths()
+    data_dir = Path(_get("CALIBER158_LAYER_DATA_DIR", "data/layers"))
+    if not data_dir.is_absolute():
+        data_dir = ROOT / data_dir
+    layer = _get_int("CALIBER158_LAYER", 0)
+    return LayerExtractEnv(
+        model=_get("CALIBER158_MODEL", "Qwen/Qwen2.5-0.5B"),
+        hidden_size=_get_int("CALIBER158_HIDDEN_SIZE", 896),
+        intermediate_size=_get_int("CALIBER158_INTERMEDIATE_SIZE", 4864),
+        num_layers=_get_int("CALIBER158_NUM_LAYERS", 24),
+        layer=layer,
+        samples=_get_int("CALIBER158_SAMPLES", 100_000),
+        seed=_get_int("CALIBER158_SEED", 42),
+        data_dir=data_dir,
+        synthetic=_get_bool("CALIBER158_SYNTHETIC", False),
+        extract_batch_size=_get_int("CALIBER158_EXTRACT_BATCH_SIZE", 4096),
+    )
+
+
+@dataclass(frozen=True)
+class LayerStudentEnv:
+    dataset_path: Path
+    hidden_size: int
+    intermediate_size: int
+    ffn_rank: int
+    layer: int
+    epochs: int
+    batch_size: int
+    learning_rate: float
+    weight_decay: float
+    beta1: float
+    beta2: float
+    eps: float
+    log_every: int
+    init_scale: float
+    ternary_threshold: float
+    smoke_epochs: int
+    smoke_batch_size: int
+    smoke_samples: int
+    smoke_input_dim: int
+    smoke_intermediate_dim: int
+    smoke_output_dim: int
+    device: str
+    holdout_fraction: float
+    split_seed: int
+    use_ternary: bool
+    lr_schedule: str
+    lr_min: float
+    lr_rel_threshold: float
+    lr_min2: float
+    lr_rel_threshold2: float
+    grad_clip_max_norm: float
+    ste_mode: str
+    model_name: str
+    weight_init: str
+    ffn_scale: str
+    ffn_scale_init: str
+
+    @property
+    def quantize_label(self) -> str:
+        return "ternary" if self.use_ternary else "fp32"
+
+
+def load_layer_student_env() -> LayerStudentEnv:
+    """Load v2 layer FFN student train config from CALIBER158_*."""
+    load_dotenv()
+    layer = _get_int("CALIBER158_LAYER", 0)
+    default_path = f"data/layers/L{layer:02d}_ffn.bin"
+    dataset = Path(_get("CALIBER158_DATASET", default_path))
+    if not dataset.is_absolute():
+        dataset = ROOT / dataset
+    use_ternary = os.environ.get("CALIBER158_QUANTIZE", "1").strip() != "0"
+    lr_schedule = _get("CALIBER158_LR_SCHEDULE", "none").strip().lower()
+    if lr_schedule not in {"none", "cosine", "rel_decay"}:
+        lr_schedule = "none"
+    ste_mode = _get("CALIBER158_STE", "plain").strip().lower()
+    if ste_mode not in {"plain", "masked"}:
+        ste_mode = "plain"
+    ffn_rank = _get_int("CALIBER158_FFN_RANK", 0)
+    if ffn_rank < 0:
+        raise ValueError(f"CALIBER158_FFN_RANK must be >= 0, got {ffn_rank}")
+    hidden = _get_int("CALIBER158_HIDDEN_SIZE", 896)
+    intermediate = _get_int("CALIBER158_INTERMEDIATE_SIZE", 4864)
+    weight_init = _get("CALIBER158_INIT", "lcg").strip().lower()
+    if weight_init not in {"lcg", "teacher"}:
+        weight_init = "lcg"
+    ffn_scale = _get("CALIBER158_FFN_SCALE", "none").strip().lower()
+    if ffn_scale not in {"none", "global", "channel", "projection"}:
+        ffn_scale = "none"
+    ffn_scale_init = _get("CALIBER158_FFN_SCALE_INIT", "one").strip().lower()
+    if ffn_scale_init not in {"one", "fit"}:
+        ffn_scale_init = "one"
+    return LayerStudentEnv(
+        dataset_path=dataset,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        ffn_rank=ffn_rank,
+        layer=layer,
+        epochs=_get_int("CALIBER158_EPOCHS", 10),
+        batch_size=_get_int("CALIBER158_BATCH_SIZE", 64),
+        learning_rate=_get_float("CALIBER158_LR", 0.001),
+        weight_decay=_get_float("CALIBER158_WEIGHT_DECAY", 0.01),
+        beta1=_get_float("CALIBER158_ADAM_BETA1", 0.9),
+        beta2=_get_float("CALIBER158_ADAM_BETA2", 0.999),
+        eps=_get_float("CALIBER158_ADAM_EPS", 1e-8),
+        log_every=_get_int("CALIBER158_LOG_EVERY", 1),
+        init_scale=_get_float("CALIBER158_INIT_SCALE", 0.1),
+        ternary_threshold=_get_float("CALIBER158_TERNARY_THRESHOLD", 0.0),
+        smoke_epochs=_get_int("CALIBER158_SMOKE_EPOCHS", 3),
+        smoke_batch_size=_get_int("CALIBER158_SMOKE_BATCH_SIZE", 32),
+        smoke_samples=_get_int("CALIBER158_SMOKE_SAMPLES", 128),
+        smoke_input_dim=_get_int("CALIBER158_SMOKE_INPUT_DIM", 64),
+        smoke_intermediate_dim=_get_int("CALIBER158_SMOKE_INTERMEDIATE_DIM", 128),
+        smoke_output_dim=_get_int("CALIBER158_SMOKE_OUTPUT_DIM", 64),
+        device=resolve_student_device(),
+        holdout_fraction=_get_float("CALIBER158_HOLDOUT_FRACTION", 0.1),
+        split_seed=_get_int("CALIBER158_SEED", 42),
+        use_ternary=use_ternary,
+        lr_schedule=lr_schedule,
+        lr_min=_get_float("CALIBER158_LR_MIN", 1e-5),
+        lr_rel_threshold=_get_float("CALIBER158_LR_REL_THRESHOLD", 0.01),
+        lr_min2=_get_float("CALIBER158_LR_MIN2", 3e-5),
+        lr_rel_threshold2=_get_float("CALIBER158_LR_REL_THRESHOLD2", 0.001),
+        grad_clip_max_norm=_get_float("CALIBER158_GRAD_CLIP", 0.0),
+        ste_mode=ste_mode,
+        model_name=_get("CALIBER158_MODEL", "Qwen/Qwen2.5-0.5B"),
+        weight_init=weight_init,
+        ffn_scale=ffn_scale,
+        ffn_scale_init=ffn_scale_init,
     )

@@ -1,11 +1,11 @@
 # Сравнение прогонов обучения — L00_N0000
 
-Обновлено: 2026-06-17 (exact ternary floor ~0.44; CD→STE ❌; production exact ternary blocked)
+Обновлено: 2026-06-17 (**v1 / v2 / ternary закрыты**; quality baseline = **FP32 v0 H≤32**)
 
 **Датасет (актуальный):** `data/chains/L00_N0000.bin` — **100 000 samples** (342 MB), re-extract 2026-06-17  
 **Датасет (история):** прогоны #1–#T15 и §4k-holdout — **4096 samples** (14 MB)  
 **Teacher:** Qwen2.5-0.5B, layer=0, neuron=0  
-**Student:** Mojo v0/v1 / Torch v0/v1/v1b/exact  
+**Student:** Mojo v0 (legacy) / Torch v0 FP32 (**quality path**)  
 **GPU:** NVIDIA RTX 3050 Ti  
 
 ## Масштаб teacher (Y) — 100k
@@ -19,7 +19,8 @@
 | Split @ seed 42 | **90 000 train / 10 000 holdout** |
 
 | **Критерий Phase 1:** holdout MSE < 1e-4 **или** `rel_holdout = MSE / Var(Y) < 0.001` (0.1% дисперсии).  
-**Статус (100k, Torch):** ✅ **FP32 v0 H=128 + rel_decay** (#100k-h) `rel=0.00073`; ❌ **ternary exact** floor ~0.44 (CD oracle), STE plateau ~0.76–1.0.
+**Статус (100k, Torch):** ✅ **FP32 v0 H=16–128 + rel_decay** — Phase 1 (см. § «FP32 v0 H sweep»).  
+❌ **ternary** (v0/v1/exact/v2), **v1**, **v2 layer FFN** — **закрыты**, не улучшаем (см. § «v2 layer FFN — закрыто»).
 
 ---
 
@@ -539,11 +540,11 @@ CALIBER158_ARCH=v1 CALIBER158_HIDDEN_DIM=768 CALIBER158_BATCH_SIZE=32 \
 - **FP32 v0 H=128 + rel_decay @ 100k:** ✅ **rel=0.00073** (#100k-h).  
 - **Ternary (v0 / exact):** ❌ rel≈1.0 — rel_decay **не включается** (rel не < 0.01).
 
-### D5. Следующие шаги
+### D5. Следующие шаги (устарело — см. § «FP32 v0 H sweep», § «v2 — закрыто»)
 
-1. **Ternary production:** warm-start от FP32 v0 → quantize → fine-tune; grad clip; Mojo @ 100k.
-2. **Порт rel_decay** в Mojo train (Torch-only: `CALIBER158_LR_SCHEDULE=rel_decay`).
-3. **Не приоритет:** arch `exact` (FP32 rel≈0.23, ternary ≈0.95 — хуже v0).
+1. ~~Ternary production~~ — **closed**
+2. ~~Порт rel_decay в Mojo~~ — optional infra only
+3. ~~arch exact~~ — **closed**
 
 ```bash
 # teacher replay sanity (из python/, нужен Qwen в cache)
@@ -941,6 +942,84 @@ bash scripts/run-python.sh python/student/diag_ternary_fit.py --max-sweeps 10
 3. **Teacher init / masked STE / больше ep** — не прорыв; CD→STE **ломает** oracle за 1 ep.
 4. **FP32 v0 + rel_decay** остаётся единственным Phase 1 ✅ (#100k-h); **не production ternary**.
 5. **Production exact ternary** @ Phase 1 **заблокирован** representational floor + STE incompatibility с CD.
-6. **Следующий код (HANDOFF):** порт `exact` в Mojo — infra; quality breakthrough ternary exact **не найден**.
+6. **Следующий код (HANDOFF):** ~~порт exact в Mojo~~ **отменён**; v1/v2/ternary **закрыты** (2026-06-17 вечер).
+
+---
+
+## Production arch (2026-06-17)
+
+**Decision:** **`v0` H=1 solo** — `CALIBER158_ARCH=v0`, `CALIBER158_HIDDEN_DIM=1`, `CALIBER158_CHAIN_GROUP=1`.
+
+| Arch | params/chain | total @ 116k | vs Qwen 0.5B | 35B-A3B active asm. | Phase 1 @ 0.5B | Production |
+|------|-------------:|-------------:|:-------------|:--------------------|:---------------|:-----------|
+| **v0 H=1 solo** | 1 794 | **~209M** | **0.42× ✅** | **~2.6B ✅** | ✅ N0000, N0001 | **yes** |
+| v0 K=16 H=26 | 47 024 / group | ~343M | 0.69× ✅ | ~3.1B ❌ | ✅ 15/16 (N0011 fail) | **no** |
+| v0 H=16 per-chain | 28 689 | ~3.35B | ~7× ❌ | — | ✅ | no (size) |
+| `exact` per-chain | 1 793 | ~209M | ✅ | — | ❌ rel≈0.23 | no (quality) |
+
+**Why H=1 over K=16 H=26:** size on **both** 0.5B and 35B-A3B; K=16 adds +64% params @ 0.5B and breaks **< 3B active** on MoE target.
+
+**Rejected:** `K=16 H=26` — R&D / faster group experiments only (`make extract-group`).
+
+**Train env (0.5B gate + 35B pilot):**
+
+```bash
+CALIBER158_ARCH=v0 CALIBER158_HIDDEN_DIM=1 CALIBER158_CHAIN_GROUP=1 \
+CALIBER158_QUANTIZE=0 CALIBER158_LR_SCHEDULE=rel_decay \
+CALIBER158_EPOCHS=20 CALIBER158_LR=0.0003 make train-torch
+```
+
+---
+
+## FP32 v0 H sweep (Torch, 2026-06-17 вечер)
+
+**Цель:** минимальный bottleneck H при сохранении Phase 1 (`rel_holdout < 0.001`).
+
+**Общие env:** `arch=v0`, `QUANTIZE=0`, `EPOCHS=20`, `LR=0.0003`, `WEIGHT_DECAY=0.001`, `LR_SCHEDULE=rel_decay`, `LR_MIN=0.0001`, `LR_REL_THRESHOLD=0.01`, holdout 10% @ seed 42, dataset 100k, Torch CUDA.
+
+| ID | H | params/chain | total @ 116k chains | vs Qwen ~0.5B | best rel | final rel | Phase 1 | wall |
+|----|---|--------------|----------------------|---------------|----------|-----------|---------|------|
+| #100k-h | 128 | 229 505 | ~26.8B | ~54× | 0.00094 | **0.00073** | ✅ | — |
+| **#100k-u** | 128 | 229 505 | ~26.8B | ~54× | 0.00094 | **0.000106** | ✅ | ~27 с |
+| **#100k-v** | 32 | 57 377 | ~6.7B | ~13× | 0.00084 | **5.9×10⁻⁵** | ✅ | ~24 с |
+| **#100k-w** | 16 | 28 689 | ~3.35B | ~6.7× | 0.00035 | **4.7×10⁻⁵** | ✅ | ~25 с |
+
+**Выводы:**
+
+1. **H=16–32 достаточен** для Phase 1 на scalar chain — quality **не хуже** H=128 (в этих прогонах лучше).
+2. **H↑ не нужен** для FP32 distillation quality; default для sanity — **H=16 или H=32**.
+3. **Size fail сохраняется:** даже H=16 → **~3.35B total** (~7× Qwen) — blocker = **116k independent micro-nets**, не H.
+4. **Ternary @ любой H** — по-прежнему rel≈1 (#100k-c/j); этот sweep **не меняет** STE blocker.
+
+```bash
+# Рекомендуемый quality baseline (минимальный H)
+CALIBER158_ARCH=v0 CALIBER158_QUANTIZE=0 CALIBER158_HIDDEN_DIM=16 \
+CALIBER158_EPOCHS=20 CALIBER158_LR=0.0003 CALIBER158_WEIGHT_DECAY=0.001 \
+CALIBER158_LR_SCHEDULE=rel_decay CALIBER158_LR_MIN=0.0001 \
+CALIBER158_LR_REL_THRESHOLD=0.01 make train-torch
+```
+
+---
+
+## v2 layer FFN — закрыто (Torch, 2026-06-17)
+
+**Контекст:** pivot v2 shared FFN после провала ternary exact @ per-chain. Реализованы `extract_layer_ffn.py`, `CAL158L`, `TernaryFFNLayer`, projection scales.
+
+**Phase 1 gate:** `rel_holdout < 0.001` на vector FFN output `[896]` @ 100k `data/layers/L00_ffn.bin`.
+
+| ID | Config | pre_train rel | final rel | Phase 1 |
+|----|--------|---------------|-----------|---------|
+| v2-full-ternary | full-rank, LCG init=0.1 | — | ~10¹⁰ | ❌ forward explode |
+| v2-full-fp32 | full-rank FP32, init=0.003 | — | ~0.053 | ❌ |
+| v2-full-ternary-proj | full-rank + **projection scales** | ~1.04 | **~0.973** @ 30 ep | ❌ STE plateau |
+| v2-lr128-ternary-proj | r=128 + projection scales | ~1.04 | **~0.986** @ 20 ep | ❌ |
+| v2-lr128-fp32 | r=128 FP32 LCG | — | **~0.976** @ 20 ep | ❌ capacity |
+| v2-lr128-proj-global | global α fit | ~10²⁸ | diverge | ❌ |
+| v2-teacher-full | teacher shadow FP32 | ~10⁻¹² | ~0.053 @ train | ❌ Adam drift |
+| v2-teacher-ternary | teacher + STE | ~10¹⁰ | ~10¹⁰ | ❌ |
+
+**Per-projection FP32 scales (BitNet-style):** **необходимы** для стабильного ternary forward (rel ~1 вместо ~10¹⁶), но **недостаточны** для Phase 1 (plateau ~0.97–0.99 ≈ v0 ternary).
+
+**Решение:** **v2 не улучшаем.** Код infra (`make extract-layer`, `make train-torch-layer`) остаётся, R&D **frozen**.
 
 ---
