@@ -255,6 +255,68 @@ class CaliberEnv:
         return self.layer * self.intermediate_size + self.neuron
 
 
+@dataclass(frozen=True)
+class MoeExtractEnv:
+    model: str
+    hidden_size: int
+    moe_intermediate_size: int
+    num_experts: int
+    num_layers: int
+    layer: int
+    neuron: int
+    expert_kind: "ExpertKind"
+    expert_id: int
+    samples: int
+    seed: int
+    data_dir: Path
+    synthetic: bool
+
+    @property
+    def default_dataset_path(self) -> Path:
+        from moe_chain import MoeChainRef, ExpertKind
+
+        ref = MoeChainRef(
+            model=self.model,
+            layer=self.layer,
+            expert_kind=self.expert_kind,
+            expert_id=self.expert_id,
+            neuron=self.neuron,
+            hidden_size=self.hidden_size,
+            moe_intermediate_size=self.moe_intermediate_size,
+            num_experts=self.num_experts,
+        )
+        return self.data_dir / ref.filename()
+
+
+def load_moe_extract_env() -> MoeExtractEnv:
+    """Load MoE chain extract config from CALIBER158_* (Qwen3.6-35B-A3B pilot)."""
+    from moe_chain import ExpertKind
+
+    apply_huggingface_paths()
+    data_dir = Path(_get("CALIBER158_DATA_DIR", "data/chains"))
+    if not data_dir.is_absolute():
+        data_dir = ROOT / data_dir
+    expert_kind = ExpertKind.parse(_get("CALIBER158_EXPERT_KIND", "routed"))
+    expert_id = _get_int("CALIBER158_EXPERT_ID", 0)
+    if expert_kind == ExpertKind.SHARED and expert_id != 0:
+        raise ValueError("CALIBER158_EXPERT_KIND=shared requires CALIBER158_EXPERT_ID=0")
+    return MoeExtractEnv(
+        model=_get("CALIBER158_MODEL", "Qwen/Qwen3.6-35B-A3B"),
+        hidden_size=_get_int("CALIBER158_HIDDEN_SIZE", 2048),
+        moe_intermediate_size=_get_int("CALIBER158_MOE_INTERMEDIATE_SIZE", 512),
+        num_experts=_get_int("CALIBER158_NUM_EXPERTS", 256),
+        num_layers=_get_int("CALIBER158_NUM_LAYERS", 40),
+        layer=_get_int("CALIBER158_LAYER", 0),
+        neuron=_get_int("CALIBER158_NEURON", 0),
+        expert_kind=expert_kind,
+        expert_id=expert_id,
+        samples=_get_int("CALIBER158_SAMPLES", 100_000),
+        seed=_get_int("CALIBER158_SEED", 42),
+        data_dir=data_dir,
+        synthetic=_get_bool("CALIBER158_SYNTHETIC", False),
+    )
+
+
 def load_env() -> CaliberEnv:
     apply_huggingface_paths()
     data_dir = Path(_get("CALIBER158_DATA_DIR", "data/chains"))

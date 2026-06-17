@@ -963,6 +963,8 @@ bash scripts/run-python.sh python/student/diag_ternary_fit.py --max-sweeps 10
 
 **Train env (0.5B gate + 35B pilot):**
 
+Phase 0 formal H=1 gate **waived** — use env below on **MoE pilot** chains (P2+).
+
 ```bash
 CALIBER158_ARCH=v0 CALIBER158_HIDDEN_DIM=1 CALIBER158_CHAIN_GROUP=1 \
 CALIBER158_QUANTIZE=0 CALIBER158_LR_SCHEDULE=rel_decay \

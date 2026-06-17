@@ -445,7 +445,7 @@ make train-torch   # env см. § «Текущая фаза»
 
 Спека: [`docs/qwen3.6-35b-a3b.md`](docs/qwen3.6-35b-a3b.md). Task list — § **«Qwen3.6-35B-A3B pilot»** ниже.
 
-**Gate перед pilot:** 0.5B Phase 1 green @ **v0 H=1 solo** (`rel_holdout < 0.001` @ L00_N0000 + N0001).
+**Gate перед pilot:** ✅ **closed (waived)** — arch locked; formal 0.5B H=1 re-run skipped.
 
 **Production arch (2026-06-17):** `CALIBER158_ARCH=v0`, `CALIBER158_HIDDEN_DIM=1`, `CALIBER158_CHAIN_GROUP=1` — **~209M @ 116k**, **~0.76B MLP active @ 35B-A3B**.  
 **Rejected:** `K=16 H=26` (~343M @ 0.5B; **~3.1B assembled > 3B active** @ 35B-A3B). R&D only — `make extract-group`, `lerning_compare.md`.
@@ -492,17 +492,15 @@ Shared **K=16 H=26** (~343M) — Phase 1 mostly ✅, **not production** (size + 
 
 **Size target (H=1):** active assembled **~2.6B / ~5 GB bf16** (< 3B active ✅).
 
-### Phase 0 — gate on 0.5B (before MoE code)
+### Phase 0 — gate on 0.5B ✅ closed (waived, 2026-06-17)
 
-- [ ] **P0-1** Phase 1 @ **H=1 solo**: `rel_holdout < 0.001` @ 100k on `L00_N0000` + `L00_N0001`
+- [x] **P0-1** ~~Formal H=1 solo gate~~ — **waived** (не доделываем; quality → MoE P2-1)
 - [x] **P0-2** Production arch documented → `lerning_compare.md` § «Production arch»
-- [ ] **P0-3** `make test` green
+- [x] **P0-3** `make test` green @ last commit (`7e7af20`)
 
-```bash
-CALIBER158_ARCH=v0 CALIBER158_HIDDEN_DIM=1 CALIBER158_CHAIN_GROUP=1 \
-CALIBER158_QUANTIZE=0 CALIBER158_LR_SCHEDULE=rel_decay \
-CALIBER158_EPOCHS=20 CALIBER158_LR=0.0003 make train-torch
-```
+**Rationale:** arch выбран по size (0.5B + 35B-A3B) + FP32 v0 Phase 1 @ H=16–128; отдельный прогон `HIDDEN_DIM=1` на двух chains не блокирует pilot.
+
+**Current phase:** **P1** — MoE extract infra.
 
 ### Phase 1 — MoE extract infra (layer 0 only)
 

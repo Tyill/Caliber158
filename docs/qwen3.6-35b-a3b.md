@@ -1,6 +1,6 @@
 # Target: Qwen3.6-35B-A3B
 
-**Status:** next production-scale target after [Qwen2.5-0.5B](qwen2.5-0.5b.md) Phase 1 gate @ **v0 H=1 solo**.
+**Status:** **Phase 1 (MoE extract pilot)** — Phase 0 gate **closed (waived)**. See [HANDOFF.md](../HANDOFF.md) § pilot.
 MoE + hybrid (Gated DeltaNet + full attention). Text LM path only; vision encoder out of scope v1.
 
 ## Production arch (project-wide, 2026-06-17)
@@ -211,18 +211,32 @@ Extends [extract_chain.py](../python/extract_chain.py) sidecar / `.bin` metadata
 
 ### Weight source (teacher)
 
+Verified against `transformers>=5.2.0` (`Qwen3_5MoeSparseMoeBlock` in
+`modeling_qwen3_5_moe.py`). Text decoder path:
+`model.model.language_model.layers[L]` for `Qwen3_5MoeForConditionalGeneration`.
+
+Routed experts use **fused** `gate_up_proj` — not separate `gate_proj` / `up_proj`:
+
 ```text
 # routed expert e, neuron n, layer L
-model.model.layers[L].mlp.experts[e].gate_proj.weight[n]
-model.model.layers[L].mlp.experts[e].up_proj.weight[n]
+gate_w = layers[L].mlp.experts.gate_up_proj[e, n, :]
+up_w   = layers[L].mlp.experts.gate_up_proj[e, I_moe + n, :]
 
-# shared expert
-model.model.layers[L].mlp.shared_expert.gate_proj.weight[n]
-model.model.layers[L].mlp.shared_expert.up_proj.weight[n]
+# shared expert (separate MLP)
+gate_w = layers[L].mlp.shared_expert.gate_proj.weight[n]
+up_w   = layers[L].mlp.shared_expert.up_proj.weight[n]
 ```
 
-Exact attribute paths must be verified against `transformers` `Qwen3_5Moe` module on first
-pilot run — adjust spec if names differ.
+Scalar target (same as 0.5B): `SiLU(gate_w · x) * (up_w · x)` — pre-`down_proj`,
+without `shared_expert_gate` scaling.
+
+Legacy proposal with per-expert `gate_proj` — **incorrect** for this architecture;
+kept here only as a warning not to use:
+
+```text
+# WRONG for Qwen3.5/3.6 MoE:
+# model.model.layers[L].mlp.experts[e].gate_proj.weight[n]
+```
 
 ### Router traces (active-path sampling)
 
@@ -242,7 +256,7 @@ Optional sidecar per extract batch (not per chain):
 Used to prioritize which routed experts get datasets first; not required for shared expert
 (always active).
 
-### Env / config (proposed — not wired yet)
+### Env / config
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
@@ -250,16 +264,23 @@ Used to prioritize which routed experts get datasets first; not required for sha
 | `CALIBER158_HIDDEN_SIZE` | `2048` | D |
 | `CALIBER158_MOE_INTERMEDIATE_SIZE` | `512` | I_moe |
 | `CALIBER158_NUM_EXPERTS` | `256` | routed count |
-| `CALIBER158_NUM_EXPERTS_PER_TOK` | `8` | active routed |
 | `CALIBER158_NUM_LAYERS` | `40` | L |
 | `CALIBER158_EXPERT_KIND` | `routed` | `routed` \| `shared` |
-| `CALIBER158_EXPERT_ID` | `0` | `0 … 255` if routed |
-| `CALIBER158_DISTILL_SCOPE` | `active` | `active` \| `full` |
-| `CALIBER158_ARCH` | `v0` | |
-| `CALIBER158_HIDDEN_DIM` | `1` | H=1 solo for size |
-| `CALIBER158_CHAIN_GROUP` | `1` | no sharing at pilot |
+| `CALIBER158_EXPERT_ID` | `0` | `0 … 255` if routed; must be `0` if shared |
+| `CALIBER158_MOE_SMOKE_LOAD` | `0` | `1` = `make smoke-moe-model` loads full weights |
+| (reuse) | | `SAMPLES`, `SEED`, `LAYER`, `NEURON`, `DATA_DIR`, `TORCH` |
 
-Do not add to `.env.example` until extract pilot lands — see [config-and-env-contracts](../.cursor/rules/config-and-env-contracts.mdc).
+Commands:
+
+```bash
+make test-moe-extract          # synthetic roundtrip (CI-safe)
+make smoke-moe-model           # config only
+CALIBER158_MOE_SMOKE_LOAD=1 make smoke-moe-model   # GPU weight path smoke
+
+CALIBER158_MODEL=Qwen/Qwen3.6-35B-A3B \
+CALIBER158_LAYER=0 CALIBER158_EXPERT_KIND=shared CALIBER158_NEURON=0 \
+make extract-moe
+```
 
 ## Phase 1 success criteria
 
@@ -280,9 +301,13 @@ Order:
 
 ## Rollout plan
 
-### Phase 0 — gate (current)
+### Phase 0 — gate ✅ closed (2026-06-17, waived)
 
-Finish 0.5B Phase 1 @ **v0 H=1 solo** (`rel < 0.001` on `L00_N0000` + `L00_N0001`). See [HANDOFF.md](../HANDOFF.md) § pilot P0.
+**Decision locked:** production = **v0 H=1 solo** (`lerning_compare.md` § «Production arch»).
+
+Formal re-run @ `HIDDEN_DIM=1` on `L00_N0000` + `N0001` **не делаем** — достаточно FP32 v0 Phase 1 @ H=16–128 (H=1 ⊂ тот же family) + size math для 35B-A3B. Quality check переносим на **MoE pilot P2** (shared `N0000`).
+
+**Next:** § Phase 1 below.
 
 ### Phase 1 — MoE extract pilot (layer 0)
 

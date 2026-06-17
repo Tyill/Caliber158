@@ -7,9 +7,9 @@ PIXI := pixi run
 MOJO := $(PIXI) mojo
 
 .PHONY: help install setup setup-python build check test test-grad test-grad-v1 test-grad-gpu test-grad-gpu-v1 smoke smoke-cpu smoke-cuda \
-	info extract extract-layer train train-cpu train-cuda train-fp32-cuda train-fp32-v1-cuda \
+	info extract extract-moe extract-layer train train-cpu train-cuda train-fp32-cuda train-fp32-v1-cuda \
 	train-torch train-torch-layer smoke-torch smoke-torch-layer test-torch-parity \
-	test-layer-dataset test-chain-group extract-group clean
+	test-layer-dataset test-chain-group test-moe-extract smoke-moe-model extract-group clean
 
 help: ## Show targets
 	@printf "Caliber158 — common targets (run from repo root):\n\n"
@@ -66,6 +66,9 @@ info: ## Print env / CLI summary
 extract: ## Teacher chain dataset → data/chains/*.bin (PyTorch CUDA/CPU)
 	$(PIXI) extract
 
+extract-moe: ## MoE teacher chain → data/chains/L{layer}_E|S_*.bin (Qwen3.6 pilot)
+	$(PIXI) extract-moe
+
 extract-layer: ## Teacher layer FFN dataset → data/layers/*.bin (CAL158L)
 	$(PIXI) extract-layer
 
@@ -116,6 +119,12 @@ test-layer-dataset: ## CAL158L read/write roundtrip (not in make test)
 
 test-chain-group: ## Shared chain group loader + model (not in make test)
 	$(PIXI) test-chain-group
+
+test-moe-extract: ## MoE extract roundtrip (synthetic, not in make test)
+	$(PIXI) test-moe-extract
+
+smoke-moe-model: ## Qwen3.6 MoE config smoke; CALIBER158_MOE_SMOKE_LOAD=1 loads weights
+	$(PIXI) smoke-moe-model
 
 clean: ## Remove local build artifacts
 	rm -rf main.o main __pycache__ python/__pycache__ .mojo-cache
